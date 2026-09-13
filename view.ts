@@ -1,6 +1,6 @@
-import { App, ItemView, WorkspaceLeaf, MarkdownRenderer, Notice, setIcon } from 'obsidian';
+import { ItemView, WorkspaceLeaf, MarkdownRenderer, Notice, setIcon } from 'obsidian';
 import { ChatMessage, ToolCall, runAgentLoop, ToolDef } from './agent';
-import { t, Lang } from './i18n';
+import { t } from './i18n';
 import { VaultToolExecutor, buildToolDefs } from './tools';
 import type VaultAgentPlugin from './main';
 
@@ -27,7 +27,7 @@ export class AgentView extends ItemView {
 	}
 
 	async onClose(): Promise<void> {
-		this.plugin.saveHistory(this.messages);
+		await this.plugin.saveHistory(this.messages);
 		this.abort?.abort();
 	}
 
@@ -48,7 +48,7 @@ export class AgentView extends ItemView {
 		newBtn.addEventListener('click', () => {
 			if (this.running) return;
 			this.messages = [];
-			this.plugin.saveHistory([]);
+			void this.plugin.saveHistory([]);
 			this.renderShell();
 			this.addWelcome();
 		});
@@ -57,7 +57,7 @@ export class AgentView extends ItemView {
 		clearBtn.addEventListener('click', () => {
 			if (this.running) return;
 			this.messages = [];
-			this.plugin.saveHistory([]);
+			void this.plugin.saveHistory([]);
 			this.renderShell();
 			this.addWelcome();
 		});
@@ -148,8 +148,10 @@ export class AgentView extends ItemView {
 		setIcon(summary, result ? (result.ok ? 'check' : 'x') : 'loader-2');
 		let argsPreview = '';
 		try {
-			const a = JSON.parse(call.function.arguments || '{}');
-			argsPreview = Object.entries(a).map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join(' ');
+			const a: unknown = JSON.parse(call.function.arguments || '{}');
+			if (a !== null && typeof a === 'object') {
+				argsPreview = Object.entries(a).map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join(' ');
+			}
 		} catch { argsPreview = call.function.arguments; }
 		summary.createSpan({ text: `${call.function.name}  ${argsPreview.slice(0, 120)}` });
 		const details = chip.createEl('details', { cls: 'va-tool-details' });
@@ -260,7 +262,7 @@ export class AgentView extends ItemView {
 		} finally {
 			this.running = false;
 			this.stopBtn.hidden = true;
-			this.plugin.saveHistory(this.messages);
+			void this.plugin.saveHistory(this.messages);
 		}
 	}
 }

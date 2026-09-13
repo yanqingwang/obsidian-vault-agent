@@ -40,14 +40,15 @@ async function chatCompletion(cfg, messages, tools, h) {
     "Content-Type": "application/json",
     Authorization: "Bearer " + cfg.apiKey
   };
-  const body = JSON.stringify({
+  const payload = {
     model: cfg.model,
     messages,
     temperature: cfg.temperature ?? 0.7,
     max_tokens: cfg.maxTokens ?? 8192,
     stream: true,
     tools: tools.length ? tools.map((t2) => ({ type: "function", function: { name: t2.name, description: t2.description, parameters: t2.parameters } })) : void 0
-  });
+  };
+  const body = JSON.stringify(payload);
   const turn = { content: null, reasoning: null, toolCalls: [] };
   try {
     const res = await fetch(url, {
@@ -62,54 +63,73 @@ async function chatCompletion(cfg, messages, tools, h) {
     }
     if (!res.body)
       throw new Error("empty response body");
-    await consumeSse(res.body, (payload) => applyChunk(payload, turn, h));
+    await consumeSse(res.body, (data) => applyChunk(data, turn, h));
   } catch (e) {
     if (h.fallbackPost && !h.signal?.aborted) {
-      const out = await h.fallbackPost(url, headers, JSON.stringify({ ...JSON.parse(body), stream: false }));
+      const out = await h.fallbackPost(url, headers, JSON.stringify({ ...payload, stream: false }));
       if (out.status >= 400)
         throw new Error(`HTTP ${out.status}: ${truncate(out.body, 500)}`);
-      applyChunk(JSON.stringify(out.body ? JSON.parse(out.body) : {}), turn, h, true);
+      applyChunk(out.body || "{}", turn, h, true);
     } else {
       throw e;
     }
   }
   return turn;
 }
+function asRecord(v) {
+  return v !== null && typeof v === "object" ? v : null;
+}
 function applyChunk(payload, turn, h, nonStream = false) {
   if (!payload || payload === "[DONE]")
     return;
-  let data;
+  let parsed;
   try {
-    data = JSON.parse(payload);
+    parsed = JSON.parse(payload);
   } catch {
     return;
   }
-  const choice = data.choices?.[0];
+  const data = asRecord(parsed);
+  if (!data)
+    return;
+  const choices = Array.isArray(data.choices) ? data.choices : [];
+  const choice = asRecord(choices[0]);
   if (!choice)
     return;
-  const delta = nonStream ? { ...choice.message } : choice.delta ?? {};
-  if (typeof delta.content === "string" && delta.content.length) {
-    turn.content = (turn.content ?? "") + delta.content;
-    h.onText?.(delta.content);
+  const raw = nonStream ? choice.message : choice.delta;
+  const delta = asRecord(raw) ?? {};
+  const content = delta.content;
+  if (typeof content === "string" && content.length) {
+    turn.content = (turn.content ?? "") + content;
+    h.onText?.(content);
   }
-  if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length) {
-    turn.reasoning = (turn.reasoning ?? "") + delta.reasoning_content;
-    h.onReasoning?.(delta.reasoning_content);
+  const reasoning = delta.reasoning_content;
+  if (typeof reasoning === "string" && reasoning.length) {
+    turn.reasoning = (turn.reasoning ?? "") + reasoning;
+    h.onReasoning?.(reasoning);
   }
-  if (Array.isArray(delta.tool_calls)) {
-    for (const tc of delta.tool_calls) {
-      const idx = tc.index ?? 0;
+  const toolCallsRaw = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+  if (toolCallsRaw.length) {
+    for (const rawTc of toolCallsRaw) {
+      const tc = asRecord(rawTc);
+      if (!tc)
+        continue;
+      const fn = asRecord(tc.function);
+      const idx = typeof tc.index === "number" ? tc.index : 0;
       let target = turn.toolCalls[idx];
       if (!target) {
-        target = { id: tc.id ?? "", type: "function", function: { name: tc.function?.name ?? "", arguments: "" } };
+        target = {
+          id: typeof tc.id === "string" ? tc.id : "",
+          type: "function",
+          function: { name: typeof fn?.name === "string" ? fn.name : "", arguments: "" }
+        };
         turn.toolCalls[idx] = target;
       }
-      if (tc.id)
+      if (typeof tc.id === "string" && tc.id)
         target.id = tc.id;
-      if (tc.function?.name)
-        target.function.name = tc.function.name;
-      if (tc.function?.arguments)
-        target.function.arguments += tc.function.arguments;
+      if (typeof fn?.name === "string" && fn.name)
+        target.function.name = fn.name;
+      if (typeof fn?.arguments === "string")
+        target.function.arguments += fn.arguments;
     }
     h.onToolCallDelta?.(turn.toolCalls.filter(Boolean));
   }
@@ -380,30 +400,36 @@ var VaultToolExecutor = class {
     this.getActivePath = getActivePath;
   }
   async execute(name, argsJson) {
-    let args = {};
+    let parsed = {};
     try {
-      args = JSON.parse(argsJson || "{}");
+      parsed = JSON.parse(argsJson || "{}");
     } catch {
       return { ok: false, content: "invalid JSON arguments" };
     }
+    const args = parsed !== null && typeof parsed === "object" ? parsed : {};
+    const s = (key, fallback = "") => {
+      const v = args[key];
+      return typeof v === "string" ? v : v === void 0 || v === null ? fallback : String(v);
+    };
+    const b = (key) => args[key] === true;
     try {
       switch (name) {
         case "list_notes":
-          return ok(await this.listNotes(args.folder ?? ".", args.glob));
+          return ok(await this.listNotes(s("folder", "."), args.glob === void 0 ? void 0 : s("glob")));
         case "read_note":
-          return ok(await this.readNote(args.path));
+          return ok(await this.readNote(s("path")));
         case "search_notes":
-          return ok(await this.searchNotes(args.pattern, !!args.regex, args.folder));
+          return ok(await this.searchNotes(s("pattern"), b("regex"), args.folder === void 0 ? void 0 : s("folder")));
         case "get_active_note":
           return ok(await this.activeNote());
         case "create_note":
-          return ok(await this.createNote(args.path, args.content ?? "", !!args.overwrite));
+          return ok(await this.createNote(s("path"), s("content"), b("overwrite")));
         case "edit_note":
-          return ok(await this.editNote(args.path, args.old_string ?? "", args.new_string ?? "", !!args.replace_all));
+          return ok(await this.editNote(s("path"), s("old_string"), s("new_string"), b("replace_all")));
         case "append_note":
-          return ok(await this.appendNote(args.path, args.content ?? ""));
+          return ok(await this.appendNote(s("path"), s("content")));
         case "read_properties":
-          return ok(await this.readProperties(args.path));
+          return ok(await this.readProperties(s("path")));
         default:
           return { ok: false, content: `unknown tool: ${name}` };
       }
@@ -420,10 +446,10 @@ var VaultToolExecutor = class {
     let files;
     if (af instanceof import_obsidian.TFolder) {
       files = this.app.vault.getMarkdownFiles().filter((f) => f.path === fp || f.path.startsWith(fp === "/" ? "" : fp + "/"));
-    } else if (!af) {
-      files = this.app.vault.getMarkdownFiles();
-    } else {
+    } else if (af instanceof import_obsidian.TFile) {
       files = [af];
+    } else {
+      files = this.app.vault.getMarkdownFiles();
     }
     if (glob)
       files = files.filter((f) => f.name.toLowerCase().includes(String(glob).toLowerCase()));
@@ -584,7 +610,7 @@ var AgentView = class extends import_obsidian2.ItemView {
       this.renderAllHistory();
   }
   async onClose() {
-    this.plugin.saveHistory(this.messages);
+    await this.plugin.saveHistory(this.messages);
     this.abort?.abort();
   }
   st(key) {
@@ -605,7 +631,7 @@ var AgentView = class extends import_obsidian2.ItemView {
       if (this.running)
         return;
       this.messages = [];
-      this.plugin.saveHistory([]);
+      void this.plugin.saveHistory([]);
       this.renderShell();
       this.addWelcome();
     });
@@ -615,7 +641,7 @@ var AgentView = class extends import_obsidian2.ItemView {
       if (this.running)
         return;
       this.messages = [];
-      this.plugin.saveHistory([]);
+      void this.plugin.saveHistory([]);
       this.renderShell();
       this.addWelcome();
     });
@@ -696,7 +722,9 @@ var AgentView = class extends import_obsidian2.ItemView {
     let argsPreview = "";
     try {
       const a = JSON.parse(call.function.arguments || "{}");
-      argsPreview = Object.entries(a).map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join(" ");
+      if (a !== null && typeof a === "object") {
+        argsPreview = Object.entries(a).map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join(" ");
+      }
     } catch {
       argsPreview = call.function.arguments;
     }
@@ -805,7 +833,7 @@ var AgentView = class extends import_obsidian2.ItemView {
     } finally {
       this.running = false;
       this.stopBtn.hidden = true;
-      this.plugin.saveHistory(this.messages);
+      void this.plugin.saveHistory(this.messages);
     }
   }
 };
@@ -845,21 +873,22 @@ var VaultAgentPlugin = class extends import_obsidian3.Plugin {
   async onload() {
     await this.loadSettings();
     this.registerView(VIEW_TYPE_AGENT, (leaf) => new AgentView(leaf, this));
-    this.addRibbonIcon("bot-message-square", t(this.settings.lang, "viewName"), () => void this.openAgent());
-    this.addCommand({ id: "open-agent", name: "Open Vault Agent / \u6253\u5F00\u667A\u80FD\u4F53", callback: () => void this.openAgent() });
+    this.addRibbonIcon("bot-message-square", t(this.settings.lang, "viewName"), () => void this.revealAgent());
+    this.addCommand({ id: "open-agent", name: "\u6253\u5F00\u667A\u80FD\u4F53 / Open agent", callback: () => void this.revealAgent() });
     this.addSettingTab(new VASettingTab(this.app, this));
   }
   onunload() {
   }
-  async openAgent() {
+  /** Open (or reveal) the agent view; safe to call repeatedly. */
+  async revealAgent() {
     const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_AGENT);
     if (existing.length) {
-      this.app.workspace.revealLeaf(existing[0]);
+      await this.app.workspace.revealLeaf(existing[0]);
       return;
     }
     const leaf = this.app.workspace.getRightLeaf(false) ?? this.app.workspace.getLeaf(true);
     await leaf.setViewState({ type: VIEW_TYPE_AGENT, active: true });
-    this.app.workspace.revealLeaf(leaf);
+    await this.app.workspace.revealLeaf(leaf);
   }
   openSettings() {
     const setting = this.app.setting;
@@ -955,7 +984,7 @@ var VASettingTab = class extends import_obsidian3.PluginSettingTab {
         }));
       }
     }
-    new import_obsidian3.Setting(containerEl).setName(this.st("temperature")).addSlider((sl) => sl.setLimits(0, 2, 0.1).setValue(s.temperature).setDynamicTooltip().onChange(async (v) => {
+    new import_obsidian3.Setting(containerEl).setName(this.st("temperature")).addSlider((sl) => sl.setLimits(0, 2, 0.1).setValue(s.temperature).onChange(async (v) => {
       s.temperature = v;
       await this.plugin.saveSettings();
     }));

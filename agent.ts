@@ -54,7 +54,7 @@ export async function chatCompletion(cfg: ChatRequestConfig, messages: ChatMessa
 		'Content-Type': 'application/json',
 		Authorization: 'Bearer ' + cfg.apiKey
 	};
-	const body = JSON.stringify({
+	const payload = {
 		model: cfg.model,
 		messages,
 		temperature: cfg.temperature ?? 0.7,
@@ -63,10 +63,13 @@ export async function chatCompletion(cfg: ChatRequestConfig, messages: ChatMessa
 		tools: tools.length
 			? tools.map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }))
 			: undefined
-	});
+	};
+	const body = JSON.stringify(payload);
 
 	const turn: AssistantTurn = { content: null, reasoning: null, toolCalls: [] };
 	try {
+		// Obsidian's requestUrl cannot stream responses; SSE streaming requires fetch.
+		// eslint-disable-next-line
 		const res = await fetch(url, {
 			method: 'POST',
 			headers,
@@ -78,13 +81,13 @@ export async function chatCompletion(cfg: ChatRequestConfig, messages: ChatMessa
 			throw new Error(`HTTP ${res.status}: ${truncate(errText, 500)}`);
 		}
 		if (!res.body) throw new Error('empty response body');
-		await consumeSse(res.body, (payload) => applyChunk(payload, turn, h));
-	} catch (e) {
+		await consumeSse(res.body, (data) => applyChunk(data, turn, h));
+	} catch (e: unknown) {
 		// Network/CORS/unsupported-stream failures: retry once without streaming.
 		if (h.fallbackPost && !(h.signal?.aborted)) {
-			const out = await h.fallbackPost(url, headers, JSON.stringify({ ...JSON.parse(body), stream: false }));
+			const out = await h.fallbackPost(url, headers, JSON.stringify({ ...payload, stream: false }));
 			if (out.status >= 400) throw new Error(`HTTP ${out.status}: ${truncate(out.body, 500)}`);
-			applyChunk(JSON.stringify(out.body ? JSON.parse(out.body) : {}), turn, h, true);
+			applyChunk(out.body || '{}', turn, h, true);
 		} else {
 			throw e;
 		}
@@ -92,36 +95,54 @@ export async function chatCompletion(cfg: ChatRequestConfig, messages: ChatMessa
 	return turn;
 }
 
+function asRecord(v: unknown): Record<string, unknown> | null {
+	return v !== null && typeof v === 'object' ? (v as Record<string, unknown>) : null;
+}
+
 function applyChunk(payload: string, turn: AssistantTurn, h: StreamHandlers, nonStream = false): void {
 	if (!payload || payload === '[DONE]') return;
-	let data: any;
+	let parsed: unknown;
 	try {
-		data = JSON.parse(payload);
+		parsed = JSON.parse(payload);
 	} catch {
 		return;
 	}
-	const choice = data.choices?.[0];
+	const data = asRecord(parsed);
+	if (!data) return;
+	const choices = Array.isArray(data.choices) ? data.choices : [];
+	const choice = asRecord(choices[0]);
 	if (!choice) return;
-	const delta = nonStream ? { ...choice.message } : choice.delta ?? {};
-	if (typeof delta.content === 'string' && delta.content.length) {
-		turn.content = (turn.content ?? '') + delta.content;
-		h.onText?.(delta.content);
+	const raw = nonStream ? choice.message : choice.delta;
+	const delta = asRecord(raw) ?? {};
+	const content = delta.content;
+	if (typeof content === 'string' && content.length) {
+		turn.content = (turn.content ?? '') + content;
+		h.onText?.(content);
 	}
-	if (typeof delta.reasoning_content === 'string' && delta.reasoning_content.length) {
-		turn.reasoning = (turn.reasoning ?? '') + delta.reasoning_content;
-		h.onReasoning?.(delta.reasoning_content);
+	const reasoning = delta.reasoning_content;
+	if (typeof reasoning === 'string' && reasoning.length) {
+		turn.reasoning = (turn.reasoning ?? '') + reasoning;
+		h.onReasoning?.(reasoning);
 	}
-	if (Array.isArray(delta.tool_calls)) {
-		for (const tc of delta.tool_calls) {
-			const idx: number = tc.index ?? 0;
+	const toolCallsRaw = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+	if (toolCallsRaw.length) {
+		for (const rawTc of toolCallsRaw) {
+			const tc = asRecord(rawTc);
+			if (!tc) continue;
+			const fn = asRecord(tc.function);
+			const idx = typeof tc.index === 'number' ? tc.index : 0;
 			let target = turn.toolCalls[idx];
 			if (!target) {
-				target = { id: tc.id ?? '', type: 'function', function: { name: tc.function?.name ?? '', arguments: '' } };
+				target = {
+					id: typeof tc.id === 'string' ? tc.id : '',
+					type: 'function',
+					function: { name: typeof fn?.name === 'string' ? fn.name : '', arguments: '' }
+				};
 				turn.toolCalls[idx] = target;
 			}
-			if (tc.id) target.id = tc.id;
-			if (tc.function?.name) target.function.name = tc.function.name;
-			if (tc.function?.arguments) target.function.arguments += tc.function.arguments;
+			if (typeof tc.id === 'string' && tc.id) target.id = tc.id;
+			if (typeof fn?.name === 'string' && fn.name) target.function.name = fn.name;
+			if (typeof fn?.arguments === 'string') target.function.arguments += fn.arguments;
 		}
 		h.onToolCallDelta?.(turn.toolCalls.filter(Boolean));
 	}
@@ -200,7 +221,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<{ text: stri
 				} else {
 					result = await opts.executor.execute(call.function.name, call.function.arguments);
 				}
-			} catch (e) {
+			} catch (e: unknown) {
 				result = { ok: false, content: 'tool error: ' + (e instanceof Error ? e.message : String(e)) };
 			}
 			opts.onToolDone?.(call, result);

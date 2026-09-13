@@ -62,8 +62,8 @@ export default class VaultAgentPlugin extends Plugin {
 	async onload(): Promise<void> {
 		await this.loadSettings();
 		this.registerView(VIEW_TYPE_AGENT, (leaf: WorkspaceLeaf) => new AgentView(leaf, this));
-		this.addRibbonIcon('bot-message-square', t(this.settings.lang, 'viewName'), () => void this.openAgent());
-		this.addCommand({ id: 'open-agent', name: 'Open Vault Agent / 打开智能体', callback: () => void this.openAgent() });
+		this.addRibbonIcon('bot-message-square', t(this.settings.lang, 'viewName'), () => void this.revealAgent());
+		this.addCommand({ id: 'open-agent', name: '打开智能体 / Open agent', callback: () => void this.revealAgent() });
 		this.addSettingTab(new VASettingTab(this.app, this));
 	}
 
@@ -71,15 +71,16 @@ export default class VaultAgentPlugin extends Plugin {
 		// Obsidian detaches registered views automatically.
 	}
 
-	async openAgent(): Promise<void> {
+	/** Open (or reveal) the agent view; safe to call repeatedly. */
+	async revealAgent(): Promise<void> {
 		const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_AGENT);
 		if (existing.length) {
-			this.app.workspace.revealLeaf(existing[0]);
+			await this.app.workspace.revealLeaf(existing[0]);
 			return;
 		}
 		const leaf = this.app.workspace.getRightLeaf(false) ?? this.app.workspace.getLeaf(true);
 		await leaf.setViewState({ type: VIEW_TYPE_AGENT, active: true });
-		this.app.workspace.revealLeaf(leaf);
+		await this.app.workspace.revealLeaf(leaf);
 	}
 
 	openSettings(): void {
@@ -198,7 +199,7 @@ class VASettingTab extends PluginSettingTab {
 		}
 
 		new Setting(containerEl).setName(this.st('temperature'))
-			.addSlider(sl => sl.setLimits(0, 2, 0.1).setValue(s.temperature).setDynamicTooltip()
+			.addSlider(sl => sl.setLimits(0, 2, 0.1).setValue(s.temperature)
 				.onChange(async v => { s.temperature = v; await this.plugin.saveSettings(); }));
 
 		new Setting(containerEl).setName(this.st('maxTokens'))

@@ -105,25 +105,31 @@ export class VaultToolExecutor implements ToolExecutor {
 	constructor(private app: App, private getActivePath: () => string | null) {}
 
 	async execute(name: string, argsJson: string): Promise<{ ok: boolean; content: string }> {
-		let args: any = {};
+		let parsed: unknown = {};
 		try {
-			args = JSON.parse(argsJson || '{}');
+			parsed = JSON.parse(argsJson || '{}');
 		} catch {
 			return { ok: false, content: 'invalid JSON arguments' };
 		}
+		const args = parsed !== null && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+		const s = (key: string, fallback = ''): string => {
+			const v = args[key];
+			return typeof v === 'string' ? v : v === undefined || v === null ? fallback : String(v);
+		};
+		const b = (key: string): boolean => args[key] === true;
 		try {
 			switch (name) {
-				case 'list_notes': return ok(await this.listNotes(args.folder ?? '.', args.glob));
-				case 'read_note': return ok(await this.readNote(args.path));
-				case 'search_notes': return ok(await this.searchNotes(args.pattern, !!args.regex, args.folder));
+				case 'list_notes': return ok(await this.listNotes(s('folder', '.'), args.glob === undefined ? undefined : s('glob')));
+				case 'read_note': return ok(await this.readNote(s('path')));
+				case 'search_notes': return ok(await this.searchNotes(s('pattern'), b('regex'), args.folder === undefined ? undefined : s('folder')));
 				case 'get_active_note': return ok(await this.activeNote());
-				case 'create_note': return ok(await this.createNote(args.path, args.content ?? '', !!args.overwrite));
-				case 'edit_note': return ok(await this.editNote(args.path, args.old_string ?? '', args.new_string ?? '', !!args.replace_all));
-				case 'append_note': return ok(await this.appendNote(args.path, args.content ?? ''));
-				case 'read_properties': return ok(await this.readProperties(args.path));
+				case 'create_note': return ok(await this.createNote(s('path'), s('content'), b('overwrite')));
+				case 'edit_note': return ok(await this.editNote(s('path'), s('old_string'), s('new_string'), b('replace_all')));
+				case 'append_note': return ok(await this.appendNote(s('path'), s('content')));
+				case 'read_properties': return ok(await this.readProperties(s('path')));
 				default: return { ok: false, content: `unknown tool: ${name}` };
 			}
-		} catch (e) {
+		} catch (e: unknown) {
 			return { ok: false, content: 'error: ' + (e instanceof Error ? e.message : String(e)) };
 		}
 	}
@@ -138,10 +144,10 @@ export class VaultToolExecutor implements ToolExecutor {
 		let files: TFile[];
 		if (af instanceof TFolder) {
 			files = this.app.vault.getMarkdownFiles().filter(f => f.path === fp || f.path.startsWith(fp === '/' ? '' : fp + '/'));
-		} else if (!af) {
-			files = this.app.vault.getMarkdownFiles();
+		} else if (af instanceof TFile) {
+			files = [af];
 		} else {
-			files = [af as TFile];
+			files = this.app.vault.getMarkdownFiles();
 		}
 		if (glob) files = files.filter(f => f.name.toLowerCase().includes(String(glob).toLowerCase()));
 		files = files.slice(0, 500);
