@@ -28,6 +28,7 @@ export interface VASettings {
 	providerId: string;
 	baseUrl: string;
 	apiKey: string;
+	proxyUrl: string;
 	model: string;
 	temperature: number;
 	maxTokens: number;
@@ -43,6 +44,7 @@ const DEFAULT_SETTINGS: VASettings = {
 	providerId: 'deepseek',
 	baseUrl: 'https://api.deepseek.com/v1',
 	apiKey: '',
+	proxyUrl: '',
 	model: 'deepseek-chat',
 	temperature: 0.7,
 	maxTokens: 8192,
@@ -152,6 +154,11 @@ class VASettingTab extends PluginSettingTab {
 				name: this.st('apiKey'),
 				desc: this.st('apiKeyDesc'),
 				control: { type: 'text', key: 'apiKey', placeholder: 'sk-…' }
+			},
+			{
+				name: this.st('proxy'),
+				desc: this.st('proxyDesc'),
+				control: { type: 'text', key: 'proxyUrl', placeholder: 'http://127.0.0.1:9000' }
 			},
 			{
 				name: this.st('model'),
@@ -281,6 +288,12 @@ class VASettingTab extends PluginSettingTab {
 				tx.setValue(s.apiKey)
 					.onChange(async v => { s.apiKey = v.trim(); await this.plugin.saveSettings(); });
 			});
+
+		new Setting(containerEl)
+			.setName(this.st('proxy'))
+			.setDesc(this.st('proxyDesc'))
+			.addText(tx => tx.setValue(s.proxyUrl)
+				.onChange(async v => { s.proxyUrl = v.trim(); await this.plugin.saveSettings(); }));
 
 		const modelSetting = new Setting(containerEl)
 			.setName(this.st('model'))

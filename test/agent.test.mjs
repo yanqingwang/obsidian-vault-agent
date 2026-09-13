@@ -13,14 +13,30 @@ import { join } from 'node:path';
 // 1. Bundle agent.ts to a temp ESM module.
 const dir = mkdtempSync(join(tmpdir(), 'va-test-'));
 const out = join(dir, 'agent.mjs');
-await build({
-	entryPoints: [new URL('../agent.ts', import.meta.url).pathname],
-	outfile: out,
-	bundle: true,
-	format: 'esm',
-	platform: 'node'
-});
+const outProxy = join(dir, 'proxyFetch.mjs');
+await Promise.all([
+	build({
+		entryPoints: [new URL('../agent.ts', import.meta.url).pathname],
+		outfile: out,
+		bundle: true,
+		format: 'esm',
+		platform: 'node'
+	}),
+	build({
+		entryPoints: [new URL('../proxyFetch.ts', import.meta.url).pathname],
+		outfile: outProxy,
+		bundle: true,
+		format: 'esm',
+		platform: 'node'
+	})
+]);
 const { runAgentLoop, normalizeReasoning } = await import(pathToFileURL(out).href);
+const { parseProxy, makeProxyFetch } = await import(pathToFileURL(outProxy).href);
+
+// Node shim so proxyFetch's window.require resolves node modules in tests.
+const { createRequire } = await import('node:module');
+const nodeReq = createRequire(import.meta.url);
+globalThis.window = { require: (id) => nodeReq(id) };
 
 // 2. Mock server: turn 1 streams a create_note tool call; turn 2 streams the final answer.
 const seenBodies = [];
@@ -140,5 +156,51 @@ const deniedMsg = messages2.find(m => m.role === 'tool');
 assert.ok(deniedMsg && deniedMsg.content === 'USER_DENIED', 'denial fed back to model');
 assert.equal(executed.length, 1, 'executor not called when denied');
 
+// 7. Local proxy: request routed through an HTTP forward proxy (absolute-URI).
+const forwarded = [];
+const proxyServer = http.createServer((req, res) => {
+	forwarded.push(req.url);
+	const target = new URL(req.url);
+	const fwd = http.request(
+		{ host: target.hostname, port: target.port, path: target.pathname + target.search, method: req.method, headers: { ...req.headers, host: target.host } },
+		(r2) => {
+			res.writeHead(r2.statusCode, r2.headers);
+			r2.pipe(res);
+		}
+	);
+	fwd.on('error', () => { try { res.writeHead(502); res.end(); } catch { } });
+	req.pipe(fwd);
+});
+await new Promise(r => proxyServer.listen(0, '127.0.0.1', r));
+const proxyPort = proxyServer.address().port;
+
+// parseProxy unit checks
+assert.deepEqual(parseProxy('127.0.0.1:9000'), { host: '127.0.0.1', port: 9000 });
+assert.deepEqual(parseProxy('http://127.0.0.1:9000'), { host: '127.0.0.1', port: 9000 });
+assert.deepEqual(parseProxy('http://user:secret@10.0.0.8:3128'), { host: '10.0.0.8', port: 3128, auth: 'Basic dXNlcjpzZWNyZXQ=' });
+assert.throws(() => parseProxy('socks5://127.0.0.1:1080'), /SOCKS/, 'socks rejected');
+assert.throws(() => parseProxy('not a proxy'), /invalid proxy/, 'garbage rejected');
+
+const pf = makeProxyFetch(`http://127.0.0.1:${proxyPort}`);
+const proxied = await pf(`http://127.0.0.1:${port}/v1/chat/completions`, {
+	method: 'POST',
+	headers: { 'Content-Type': 'application/json', Authorization: 'Bearer sk-test' },
+	body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] })
+});
+assert.equal(proxied.status, 200, 'proxied request reached the target');
+assert.ok(forwarded.some(u => u.startsWith(`http://127.0.0.1:${port}/`)), 'proxy saw absolute-URI forward');
+// Streaming read through the proxied response body.
+const reader = proxied.body.getReader();
+const chunks = [];
+while (true) {
+	const { done, value } = await reader.read();
+	if (done) break;
+	chunks.push(new TextDecoder().decode(value));
+}
+const sseBody = chunks.join('');
+assert.ok(sseBody.includes('data:'), 'SSE body streamed through the proxy');
+assert.ok(sseBody.includes('笔记') || sseBody.includes('tool_calls'), 'proxied SSE payload intact');
+
+proxyServer.close();
 server.close();
 console.log('✅ all agent-loop tests passed');

@@ -1,5 +1,6 @@
 import { ItemView, WorkspaceLeaf, MarkdownRenderer, Notice, setIcon } from 'obsidian';
 import { ChatMessage, ToolCall, runAgentLoop, ToolDef, normalizeReasoning } from './agent';
+import { FetchLike, makeProxyFetch } from './proxyFetch';
 import { t } from './i18n';
 import { VaultToolExecutor, buildToolDefs } from './tools';
 import type VaultAgentPlugin from './main';
@@ -311,7 +312,8 @@ export class AgentView extends ItemView {
 		const chipQueue: HTMLElement[] = [];
 
 		try {
-			const fetchImpl: typeof fetch = (url, init) => window.fetch(url, init);
+			const proxy = s.proxyUrl.trim();
+			const fetchImpl: FetchLike = proxy ? makeProxyFetch(proxy) : (url, init) => window.fetch(url, init);
 			const { text, reasoning, hitCap } = await runAgentLoop({
 				baseUrl: s.baseUrl,
 				apiKey: s.apiKey,
@@ -325,7 +327,12 @@ export class AgentView extends ItemView {
 				signal: this.abort.signal,
 				confirmWrite: (summary) => this.confirmWrite(summary),
 				fetchImpl,
-				fallbackPost: (url, headers, body) => this.plugin.fallbackPost(url, headers, body),
+				fallbackPost: proxy
+					? async (url, headers, body) => {
+						const r = await fetchImpl(url, { method: 'POST', headers, body });
+						return { status: r.status, body: await r.text() };
+					}
+					: (url, headers, body) => this.plugin.fallbackPost(url, headers, body),
 				onText: d => stream.push(d),
 				onReasoning: d => stream.pushReasoning(d),
 				onToolStart: call => chipQueue.push(this.addToolChip(call)),
