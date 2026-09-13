@@ -139,22 +139,64 @@ export class AgentView extends ItemView {
 		return el;
 	}
 
-	/** Streaming assistant bubble: plain text while streaming, markdown once done. */
-	private beginStreamingBubble(): { el: HTMLElement; textEl: HTMLElement; push(delta: string): void; finish(full: string): void } {
+	/**
+	 * Streaming assistant bubble: reasoning (if the model streams it) goes into a
+	 * collapsible block that stays collapsed above the answer once done.
+	 */
+	private beginStreamingBubble(): {
+		el: HTMLElement;
+		push(delta: string): void;
+		pushReasoning(delta: string): void;
+		finish(full: string, reasoning: string): void;
+	} {
 		const el = this.msgsEl.createDiv({ cls: 'va-msg va-assistant va-streaming' });
 		const textEl = el.createDiv({ cls: 'va-stream-text' });
 		let acc = '';
+		let reasoningEl: HTMLElement | null = null;
+		let reasoningTextEl: HTMLElement | null = null;
+		let reasoningAcc = '';
 		return {
 			el,
-			textEl,
 			push: (delta) => {
 				acc += delta;
 				textEl.textContent = acc;
 				this.scrollBottom();
 			},
-			finish: (full) => {
+			pushReasoning: (delta) => {
+				let d = reasoningEl;
+				if (!d) {
+					d = el.createEl('details', { cls: 'va-reasoning' });
+					d.setAttribute('open', '');
+					d.createEl('summary', { text: this.st('thinking') });
+					reasoningTextEl = d.createDiv({ cls: 'va-reasoning-text' });
+					el.insertBefore(d, textEl);
+					reasoningEl = d;
+				}
+				if (reasoningAcc && delta) reasoningAcc += '\n';
+				reasoningAcc += delta;
+				if (reasoningTextEl) {
+					reasoningTextEl.textContent = reasoningAcc;
+					reasoningTextEl.scrollTop = reasoningTextEl.scrollHeight;
+				}
+				this.scrollBottom();
+			},
+			finish: (full, reasoning) => {
 				el.removeClass('va-streaming');
 				textEl.remove();
+				const finalReasoning = (reasoning || reasoningAcc).trim();
+				if (finalReasoning) {
+					if (!reasoningEl) {
+						reasoningEl = el.createEl('details', { cls: 'va-reasoning' });
+						reasoningEl.createEl('summary', { text: this.st('thought') });
+						reasoningTextEl = reasoningEl.createDiv({ cls: 'va-reasoning-text' });
+					}
+					reasoningEl.removeAttribute('open');
+					const summary = reasoningEl.querySelector('summary');
+					if (summary) summary.textContent = this.st('thought');
+					if (reasoningTextEl) reasoningTextEl.textContent = finalReasoning;
+				} else if (reasoningEl) {
+					reasoningEl.remove();
+				}
 				const done = el.createDiv({ cls: 'va-assistant-body' });
 				this.renderMarkdown(done, full || acc);
 				this.scrollBottom();
@@ -271,7 +313,7 @@ export class AgentView extends ItemView {
 
 		try {
 			const fetchImpl: typeof fetch = (url, init) => window.fetch(url, init);
-			const { text, hitCap } = await runAgentLoop({
+			const { text, reasoning, hitCap } = await runAgentLoop({
 				baseUrl: s.baseUrl,
 				apiKey: s.apiKey,
 				model: s.model,
@@ -286,19 +328,20 @@ export class AgentView extends ItemView {
 				fetchImpl,
 				fallbackPost: (url, headers, body) => this.plugin.fallbackPost(url, headers, body),
 				onText: d => stream.push(d),
+				onReasoning: d => stream.pushReasoning(d),
 				onToolStart: call => chipQueue.push(this.addToolChip(call)),
 				onToolDone: (_call, result) => {
 					const chip = chipQueue.shift();
 					if (chip) this.completeToolChip(chip, result);
 				}
 			});
-			stream.finish(text);
+			stream.finish(text, reasoning);
 			if (hitCap) new Notice(this.st('maxIterReached'));
 			this.messages.push({ role: 'assistant', content: text });
 		} catch (e: unknown) {
 			const aborted = this.abort.signal.aborted;
 			const msg = aborted ? (s.lang === 'zh' ? '（已停止）' : '(stopped)') : `${this.st('errPrefix')}: ${e instanceof Error ? e.message : String(e)}`;
-			stream.finish(msg);
+			stream.finish(msg, '');
 			this.messages.push({ role: 'assistant', content: msg });
 			if (!aborted) new Notice(msg.slice(0, 200));
 		} finally {

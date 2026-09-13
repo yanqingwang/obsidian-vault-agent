@@ -170,7 +170,7 @@ async function runAgentLoop(opts) {
     });
     const calls = turn.toolCalls.filter(Boolean);
     if (!calls.length) {
-      return { text: turn.content ?? turn.reasoning ?? "", hitCap: false };
+      return { text: turn.content ?? "", reasoning: turn.reasoning ?? "", hitCap: false };
     }
     opts.messages.push({
       role: "assistant",
@@ -200,7 +200,7 @@ async function runAgentLoop(opts) {
     }
     hitCap = true;
   }
-  return { text: "", hitCap };
+  return { text: "", reasoning: "", hitCap };
 }
 function truncate(s, n) {
   if (s.length <= n)
@@ -222,6 +222,7 @@ var zh = {
   toolCall: "\u5DE5\u5177\u8C03\u7528",
   toolResult: "\u7ED3\u679C",
   thinking: "\u601D\u8003\u4E2D\u2026",
+  thought: "\u{1F4AD} \u601D\u8003\u8FC7\u7A0B",
   streaming: "\u751F\u6210\u4E2D\u2026",
   errPrefix: "\u8BF7\u6C42\u5931\u8D25",
   maxIterReached: "\u5DF2\u8FBE\u5355\u8F6E\u5DE5\u5177\u8C03\u7528\u4E0A\u9650\uFF0C\u8BF7\u7EE7\u7EED\u5BF9\u8BDD\u8BA9\u5B83\u63A5\u7740\u505A\u3002",
@@ -266,6 +267,7 @@ var en = {
   toolCall: "Tool call",
   toolResult: "Result",
   thinking: "Thinking\u2026",
+  thought: "\u{1F4AD} Thought process",
   streaming: "Generating\u2026",
   errPrefix: "Request failed",
   maxIterReached: "Tool-call limit for this turn reached \u2014 keep chatting to continue.",
@@ -727,22 +729,62 @@ var AgentView = class extends import_obsidian2.ItemView {
     this.scrollBottom();
     return el;
   }
-  /** Streaming assistant bubble: plain text while streaming, markdown once done. */
+  /**
+   * Streaming assistant bubble: reasoning (if the model streams it) goes into a
+   * collapsible block that stays collapsed above the answer once done.
+   */
   beginStreamingBubble() {
     const el = this.msgsEl.createDiv({ cls: "va-msg va-assistant va-streaming" });
     const textEl = el.createDiv({ cls: "va-stream-text" });
     let acc = "";
+    let reasoningEl = null;
+    let reasoningTextEl = null;
+    let reasoningAcc = "";
     return {
       el,
-      textEl,
       push: (delta) => {
         acc += delta;
         textEl.textContent = acc;
         this.scrollBottom();
       },
-      finish: (full) => {
+      pushReasoning: (delta) => {
+        let d = reasoningEl;
+        if (!d) {
+          d = el.createEl("details", { cls: "va-reasoning" });
+          d.setAttribute("open", "");
+          d.createEl("summary", { text: this.st("thinking") });
+          reasoningTextEl = d.createDiv({ cls: "va-reasoning-text" });
+          el.insertBefore(d, textEl);
+          reasoningEl = d;
+        }
+        if (reasoningAcc && delta)
+          reasoningAcc += "\n";
+        reasoningAcc += delta;
+        if (reasoningTextEl) {
+          reasoningTextEl.textContent = reasoningAcc;
+          reasoningTextEl.scrollTop = reasoningTextEl.scrollHeight;
+        }
+        this.scrollBottom();
+      },
+      finish: (full, reasoning) => {
         el.removeClass("va-streaming");
         textEl.remove();
+        const finalReasoning = (reasoning || reasoningAcc).trim();
+        if (finalReasoning) {
+          if (!reasoningEl) {
+            reasoningEl = el.createEl("details", { cls: "va-reasoning" });
+            reasoningEl.createEl("summary", { text: this.st("thought") });
+            reasoningTextEl = reasoningEl.createDiv({ cls: "va-reasoning-text" });
+          }
+          reasoningEl.removeAttribute("open");
+          const summary = reasoningEl.querySelector("summary");
+          if (summary)
+            summary.textContent = this.st("thought");
+          if (reasoningTextEl)
+            reasoningTextEl.textContent = finalReasoning;
+        } else if (reasoningEl) {
+          reasoningEl.remove();
+        }
         const done = el.createDiv({ cls: "va-assistant-body" });
         this.renderMarkdown(done, full || acc);
         this.scrollBottom();
@@ -854,7 +896,7 @@ var AgentView = class extends import_obsidian2.ItemView {
     const chipQueue = [];
     try {
       const fetchImpl = (url, init) => window.fetch(url, init);
-      const { text, hitCap } = await runAgentLoop({
+      const { text, reasoning, hitCap } = await runAgentLoop({
         baseUrl: s.baseUrl,
         apiKey: s.apiKey,
         model: s.model,
@@ -869,6 +911,7 @@ var AgentView = class extends import_obsidian2.ItemView {
         fetchImpl,
         fallbackPost: (url, headers, body) => this.plugin.fallbackPost(url, headers, body),
         onText: (d) => stream.push(d),
+        onReasoning: (d) => stream.pushReasoning(d),
         onToolStart: (call) => chipQueue.push(this.addToolChip(call)),
         onToolDone: (_call, result) => {
           const chip = chipQueue.shift();
@@ -876,14 +919,14 @@ var AgentView = class extends import_obsidian2.ItemView {
             this.completeToolChip(chip, result);
         }
       });
-      stream.finish(text);
+      stream.finish(text, reasoning);
       if (hitCap)
         new import_obsidian2.Notice(this.st("maxIterReached"));
       this.messages.push({ role: "assistant", content: text });
     } catch (e) {
       const aborted = this.abort.signal.aborted;
       const msg = aborted ? s.lang === "zh" ? "\uFF08\u5DF2\u505C\u6B62\uFF09" : "(stopped)" : `${this.st("errPrefix")}: ${e instanceof Error ? e.message : String(e)}`;
-      stream.finish(msg);
+      stream.finish(msg, "");
       this.messages.push({ role: "assistant", content: msg });
       if (!aborted)
         new import_obsidian2.Notice(msg.slice(0, 200));

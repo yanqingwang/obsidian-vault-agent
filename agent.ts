@@ -190,11 +190,17 @@ export interface AgentLoopOptions extends ChatRequestConfig {
 	fallbackPost?: StreamHandlers['fallbackPost'];
 }
 
+export interface AgentLoopResult {
+	text: string;
+	reasoning: string;
+	hitCap: boolean;
+}
+
 /**
  * Agentic loop: chat → (tool calls → execute → feed results) → repeat → final text.
  * Returns the final assistant text (empty if the loop hit its iteration cap mid-flight).
  */
-export async function runAgentLoop(opts: AgentLoopOptions): Promise<{ text: string; hitCap: boolean }> {
+export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult> {
 	const maxIter = opts.maxIterations ?? 12;
 	let hitCap = false;
 	for (let i = 0; i < maxIter; i++) {
@@ -207,7 +213,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<{ text: stri
 		});
 		const calls = turn.toolCalls.filter(Boolean);
 		if (!calls.length) {
-			return { text: turn.content ?? turn.reasoning ?? '', hitCap: false };
+			return { text: turn.content ?? '', reasoning: turn.reasoning ?? '', hitCap: false };
 		}
 		opts.messages.push({
 			role: 'assistant',
@@ -238,7 +244,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<{ text: stri
 		}
 		hitCap = true; // stays true only if we exhaust the loop below
 	}
-	return { text: '', hitCap };
+	return { text: '', reasoning: '', hitCap };
 }
 
 export function truncate(s: string, n: number): string {

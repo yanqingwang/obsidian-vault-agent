@@ -69,6 +69,29 @@
   line-height: 1.5;
 }
 .va-assistant .va-stream-text { white-space: pre-wrap; word-break: break-word; }
+/* Live reasoning (thinking) block: streams while the model thinks, collapsed afterwards. */
+.va-reasoning {
+  margin: 0 0 0.5em;
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--interactive-accent);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  font-size: var(--font-ui-smaller);
+}
+.va-reasoning summary {
+  cursor: pointer;
+  padding: 4px 10px;
+  color: var(--text-muted);
+  user-select: none;
+}
+.va-reasoning-text {
+  padding: 0 10px 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-muted);
+  max-height: 260px;
+  overflow: auto;
+}
 /* Compact markdown: default theme paragraph margins read as blank lines in a chat bubble. */
 .va-assistant p, .va-welcome p { margin: 0.35em 0; }
 .va-assistant > *:first-child, .va-welcome > *:first-child { margin-top: 0; }
