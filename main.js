@@ -666,12 +666,12 @@ var AgentView = class extends import_obsidian2.ItemView {
     this.inputAreaEl = root.createDiv({ cls: "va-input-area" });
     const ta = this.inputAreaEl.createEl("textarea", { cls: "va-input", attr: { placeholder: this.st("inputPlaceholder"), rows: "3" } });
     this.inputEl = ta;
-    const sendBtn = this.inputAreaEl.createDiv({ cls: "va-send-row" });
-    this.stopBtn = sendBtn.createEl("button", { cls: "va-stop-btn", text: "\u23F9 " + this.st("stop") });
-    this.stopBtn.hidden = true;
+    const btnRow = this.inputAreaEl.createDiv({ cls: "va-send-row" });
+    this.stopBtn = btnRow.createEl("button", { cls: "va-stop-btn", text: "\u23F9 " + this.st("stop") });
+    this.stopBtn.disabled = true;
     this.stopBtn.addEventListener("click", () => this.abort?.abort());
-    const send = sendBtn.createEl("button", { cls: "va-send-btn mod-cta", text: "\u27A4 " + this.st("send") });
-    send.addEventListener("click", () => void this.send());
+    this.sendBtn = btnRow.createEl("button", { cls: "va-send-btn mod-cta", text: "\u27A4 " + this.st("send") });
+    this.sendBtn.addEventListener("click", () => void this.send());
     ta.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
@@ -681,7 +681,7 @@ var AgentView = class extends import_obsidian2.ItemView {
   }
   addWelcome() {
     const el = this.msgsEl.createDiv({ cls: "va-welcome" });
-    void import_obsidian2.MarkdownRenderer.render(this.app, this.st("welcome"), el, "", this);
+    this.renderMarkdown(el, this.st("welcome"));
   }
   renderAllHistory() {
     for (const m of this.messages) {
@@ -695,6 +695,26 @@ var AgentView = class extends import_obsidian2.ItemView {
   scrollBottom() {
     this.msgsEl.scrollTop = this.msgsEl.scrollHeight;
   }
+  /**
+   * Render markdown without the stray blank lines Obsidian's renderer produces
+   * (empty <p> from leading/trailing newlines, <br> runs at block edges).
+   */
+  renderMarkdown(container, text) {
+    void import_obsidian2.MarkdownRenderer.render(this.app, text.trim() || "\u2026", container, "", this).then(() => {
+      container.querySelectorAll("br").forEach((br) => {
+        const parent = br.parentElement;
+        if (!parent)
+          return;
+        if (br.previousElementSibling === null || br.nextElementSibling === null || br.previousElementSibling?.tagName === "BR") {
+          br.remove();
+        }
+      });
+      container.querySelectorAll("p, li").forEach((p) => {
+        if (!p.textContent?.trim() && !p.querySelector("img,video,a,code,pre,table,svg"))
+          p.remove();
+      });
+    });
+  }
   renderUserBubble(text) {
     const el = this.msgsEl.createDiv({ cls: "va-msg va-user" });
     el.createDiv({ cls: "va-user-text", text });
@@ -703,7 +723,7 @@ var AgentView = class extends import_obsidian2.ItemView {
   }
   renderAssistantDone(text) {
     const el = this.msgsEl.createDiv({ cls: "va-msg va-assistant" });
-    void import_obsidian2.MarkdownRenderer.render(this.app, text || "\u2026", el, "", this);
+    this.renderMarkdown(el, text);
     this.scrollBottom();
     return el;
   }
@@ -724,15 +744,17 @@ var AgentView = class extends import_obsidian2.ItemView {
         el.removeClass("va-streaming");
         textEl.remove();
         const done = el.createDiv({ cls: "va-assistant-body" });
-        void import_obsidian2.MarkdownRenderer.render(this.app, full || acc || "\u2026", done, "", this);
+        this.renderMarkdown(done, full || acc);
         this.scrollBottom();
       }
     };
   }
-  addToolChip(call, result) {
-    const chip = this.msgsEl.createDiv({ cls: "va-tool-chip" + (result && !result.ok ? " va-tool-error" : "") });
+  addToolChip(call) {
+    const chip = this.msgsEl.createDiv({ cls: "va-tool-chip" });
     const summary = chip.createDiv({ cls: "va-tool-summary" });
-    (0, import_obsidian2.setIcon)(summary, result ? result.ok ? "check" : "x" : "loader-2");
+    const icon = summary.createSpan({ cls: "va-tool-icon" });
+    (0, import_obsidian2.setIcon)(icon, "loader-2");
+    icon.addClass("va-spinner");
     let argsPreview = "";
     try {
       const a = JSON.parse(call.function.arguments || "{}");
@@ -745,9 +767,22 @@ var AgentView = class extends import_obsidian2.ItemView {
     summary.createSpan({ text: `${call.function.name}  ${argsPreview.slice(0, 120)}` });
     const details = chip.createEl("details", { cls: "va-tool-details" });
     details.createEl("summary", { text: this.st("toolResult") });
-    details.createEl("pre", { text: result ? result.content.slice(0, 2e3) : "\u2026" });
+    details.createEl("pre", { text: "\u2026" });
     this.scrollBottom();
     return chip;
+  }
+  /** Fill in the result of a tool call on its existing chip (single chip per call). */
+  completeToolChip(chip, result) {
+    if (!result.ok)
+      chip.addClass("va-tool-error");
+    const icon = chip.querySelector(".va-tool-icon");
+    if (icon) {
+      (0, import_obsidian2.setIcon)(icon, result.ok ? "check" : "x");
+      icon.removeClass("va-spinner");
+    }
+    const pre = chip.querySelector(".va-tool-details pre");
+    if (pre)
+      pre.textContent = result.content.slice(0, 2e3);
   }
   buildSystemPrompt() {
     const s = this.plugin.settings;
@@ -804,7 +839,8 @@ var AgentView = class extends import_obsidian2.ItemView {
     this.inputEl.value = "";
     this.running = true;
     this.abort = new AbortController();
-    this.stopBtn.hidden = false;
+    this.stopBtn.disabled = false;
+    this.sendBtn.disabled = true;
     this.renderUserBubble(input);
     this.messages.push({ role: "user", content: input });
     if (this.messages[0]?.role !== "system") {
@@ -815,6 +851,7 @@ var AgentView = class extends import_obsidian2.ItemView {
     const stream = this.beginStreamingBubble();
     const tools = buildToolDefs();
     const executor = new VaultToolExecutor(this.app, () => this.app.workspace.getActiveFile()?.path ?? null);
+    const chipQueue = [];
     try {
       const fetchImpl = (url, init) => window.fetch(url, init);
       const { text, hitCap } = await runAgentLoop({
@@ -832,8 +869,12 @@ var AgentView = class extends import_obsidian2.ItemView {
         fetchImpl,
         fallbackPost: (url, headers, body) => this.plugin.fallbackPost(url, headers, body),
         onText: (d) => stream.push(d),
-        onToolStart: (call) => this.addToolChip(call),
-        onToolDone: (call, result) => this.addToolChip(call, result)
+        onToolStart: (call) => chipQueue.push(this.addToolChip(call)),
+        onToolDone: (_call, result) => {
+          const chip = chipQueue.shift();
+          if (chip)
+            this.completeToolChip(chip, result);
+        }
       });
       stream.finish(text);
       if (hitCap)
@@ -848,7 +889,8 @@ var AgentView = class extends import_obsidian2.ItemView {
         new import_obsidian2.Notice(msg.slice(0, 200));
     } finally {
       this.running = false;
-      this.stopBtn.hidden = true;
+      this.stopBtn.disabled = true;
+      this.sendBtn.disabled = false;
       void this.plugin.saveHistory(this.messages);
     }
   }

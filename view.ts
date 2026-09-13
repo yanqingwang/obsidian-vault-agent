@@ -69,12 +69,12 @@ export class AgentView extends ItemView {
 		this.inputAreaEl = root.createDiv({ cls: 'va-input-area' });
 		const ta = this.inputAreaEl.createEl('textarea', { cls: 'va-input', attr: { placeholder: this.st('inputPlaceholder'), rows: '3' } });
 		this.inputEl = ta;
-		const sendBtn = this.inputAreaEl.createDiv({ cls: 'va-send-row' });
-		this.stopBtn = sendBtn.createEl('button', { cls: 'va-stop-btn', text: '⏹ ' + this.st('stop') });
-		this.stopBtn.hidden = true;
+		const btnRow = this.inputAreaEl.createDiv({ cls: 'va-send-row' });
+		this.stopBtn = btnRow.createEl('button', { cls: 'va-stop-btn', text: '⏹ ' + this.st('stop') });
+		this.stopBtn.disabled = true;
 		this.stopBtn.addEventListener('click', () => this.abort?.abort());
-		const send = sendBtn.createEl('button', { cls: 'va-send-btn mod-cta', text: '➤ ' + this.st('send') });
-		send.addEventListener('click', () => void this.send());
+		this.sendBtn = btnRow.createEl('button', { cls: 'va-send-btn mod-cta', text: '➤ ' + this.st('send') });
+		this.sendBtn.addEventListener('click', () => void this.send());
 		ta.addEventListener('keydown', (e: KeyboardEvent) => {
 			if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
 				e.preventDefault();
@@ -87,10 +87,11 @@ export class AgentView extends ItemView {
 	private inputAreaEl!: HTMLElement;
 	private inputEl!: HTMLTextAreaElement;
 	private stopBtn!: HTMLButtonElement;
+	private sendBtn!: HTMLButtonElement;
 
 	private addWelcome(): void {
 		const el = this.msgsEl.createDiv({ cls: 'va-welcome' });
-		void MarkdownRenderer.render(this.app, this.st('welcome'), el, '', this);
+		this.renderMarkdown(el, this.st('welcome'));
 	}
 
 	private renderAllHistory(): void {
@@ -105,6 +106,25 @@ export class AgentView extends ItemView {
 		this.msgsEl.scrollTop = this.msgsEl.scrollHeight;
 	}
 
+	/**
+	 * Render markdown without the stray blank lines Obsidian's renderer produces
+	 * (empty <p> from leading/trailing newlines, <br> runs at block edges).
+	 */
+	private renderMarkdown(container: HTMLElement, text: string): void {
+		void MarkdownRenderer.render(this.app, text.trim() || '…', container, '', this).then(() => {
+			container.querySelectorAll('br').forEach(br => {
+				const parent = br.parentElement;
+				if (!parent) return;
+				if (br.previousElementSibling === null || br.nextElementSibling === null || br.previousElementSibling?.tagName === 'BR') {
+					br.remove();
+				}
+			});
+			container.querySelectorAll('p, li').forEach(p => {
+				if (!p.textContent?.trim() && !p.querySelector('img,video,a,code,pre,table,svg')) p.remove();
+			});
+		});
+	}
+
 	private renderUserBubble(text: string): HTMLElement {
 		const el = this.msgsEl.createDiv({ cls: 'va-msg va-user' });
 		el.createDiv({ cls: 'va-user-text', text });
@@ -114,7 +134,7 @@ export class AgentView extends ItemView {
 
 	private renderAssistantDone(text: string): HTMLElement {
 		const el = this.msgsEl.createDiv({ cls: 'va-msg va-assistant' });
-		void MarkdownRenderer.render(this.app, text || '…', el, '', this);
+		this.renderMarkdown(el, text);
 		this.scrollBottom();
 		return el;
 	}
@@ -136,16 +156,18 @@ export class AgentView extends ItemView {
 				el.removeClass('va-streaming');
 				textEl.remove();
 				const done = el.createDiv({ cls: 'va-assistant-body' });
-				void MarkdownRenderer.render(this.app, full || acc || '…', done, '', this);
+				this.renderMarkdown(done, full || acc);
 				this.scrollBottom();
 			}
 		};
 	}
 
-	private addToolChip(call: ToolCall, result?: { ok: boolean; content: string }): HTMLElement {
-		const chip = this.msgsEl.createDiv({ cls: 'va-tool-chip' + (result && !result.ok ? ' va-tool-error' : '') });
+	private addToolChip(call: ToolCall): HTMLElement {
+		const chip = this.msgsEl.createDiv({ cls: 'va-tool-chip' });
 		const summary = chip.createDiv({ cls: 'va-tool-summary' });
-		setIcon(summary, result ? (result.ok ? 'check' : 'x') : 'loader-2');
+		const icon = summary.createSpan({ cls: 'va-tool-icon' });
+		setIcon(icon, 'loader-2');
+		icon.addClass('va-spinner');
 		let argsPreview = '';
 		try {
 			const a: unknown = JSON.parse(call.function.arguments || '{}');
@@ -156,9 +178,21 @@ export class AgentView extends ItemView {
 		summary.createSpan({ text: `${call.function.name}  ${argsPreview.slice(0, 120)}` });
 		const details = chip.createEl('details', { cls: 'va-tool-details' });
 		details.createEl('summary', { text: this.st('toolResult') });
-		details.createEl('pre', { text: result ? result.content.slice(0, 2000) : '…' });
+		details.createEl('pre', { text: '…' });
 		this.scrollBottom();
 		return chip;
+	}
+
+	/** Fill in the result of a tool call on its existing chip (single chip per call). */
+	private completeToolChip(chip: HTMLElement, result: { ok: boolean; content: string }): void {
+		if (!result.ok) chip.addClass('va-tool-error');
+		const icon = chip.querySelector<HTMLElement>('.va-tool-icon');
+		if (icon) {
+			setIcon(icon, result.ok ? 'check' : 'x');
+			icon.removeClass('va-spinner');
+		}
+		const pre = chip.querySelector('.va-tool-details pre');
+		if (pre) pre.textContent = result.content.slice(0, 2000);
 	}
 
 	private buildSystemPrompt(): string {
@@ -218,7 +252,8 @@ export class AgentView extends ItemView {
 		this.inputEl.value = '';
 		this.running = true;
 		this.abort = new AbortController();
-		this.stopBtn.hidden = false;
+		this.stopBtn.disabled = false;
+		this.sendBtn.disabled = true;
 
 		this.renderUserBubble(input);
 		this.messages.push({ role: 'user', content: input });
@@ -231,6 +266,8 @@ export class AgentView extends ItemView {
 		const stream = this.beginStreamingBubble();
 		const tools: ToolDef[] = buildToolDefs();
 		const executor = new VaultToolExecutor(this.app, () => this.app.workspace.getActiveFile()?.path ?? null);
+		// Tool calls execute sequentially: chips complete in FIFO order.
+		const chipQueue: HTMLElement[] = [];
 
 		try {
 			const fetchImpl: typeof fetch = (url, init) => window.fetch(url, init);
@@ -249,8 +286,11 @@ export class AgentView extends ItemView {
 				fetchImpl,
 				fallbackPost: (url, headers, body) => this.plugin.fallbackPost(url, headers, body),
 				onText: d => stream.push(d),
-				onToolStart: call => this.addToolChip(call),
-				onToolDone: (call, result) => this.addToolChip(call, result)
+				onToolStart: call => chipQueue.push(this.addToolChip(call)),
+				onToolDone: (_call, result) => {
+					const chip = chipQueue.shift();
+					if (chip) this.completeToolChip(chip, result);
+				}
 			});
 			stream.finish(text);
 			if (hitCap) new Notice(this.st('maxIterReached'));
@@ -263,7 +303,8 @@ export class AgentView extends ItemView {
 			if (!aborted) new Notice(msg.slice(0, 200));
 		} finally {
 			this.running = false;
-			this.stopBtn.hidden = true;
+			this.stopBtn.disabled = true;
+			this.sendBtn.disabled = false;
 			void this.plugin.saveHistory(this.messages);
 		}
 	}
