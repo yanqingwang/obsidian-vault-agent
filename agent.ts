@@ -1,0 +1,221 @@
+/**
+ * OpenAI-compatible chat client with streaming (SSE) and an agentic tool-call loop.
+ * Framework-free so it can be unit-tested in Node with a mock server.
+ */
+
+export interface ChatMessage {
+	role: 'system' | 'user' | 'assistant' | 'tool';
+	content: string | null;
+	tool_calls?: ToolCall[];
+	tool_call_id?: string;
+}
+
+export interface ToolCall {
+	id: string;
+	type: 'function';
+	function: { name: string; arguments: string };
+}
+
+export interface ToolDef {
+	name: string;
+	description: string;
+	parameters: Record<string, unknown>;
+	/** Local-only flag: tool mutates the vault and may need user confirmation. Not sent to the API. */
+	x_write?: boolean;
+}
+
+export interface ChatRequestConfig {
+	baseUrl: string;
+	apiKey: string;
+	model: string;
+	temperature?: number;
+	maxTokens?: number;
+}
+
+export interface StreamHandlers {
+	onText?: (delta: string) => void;
+	onReasoning?: (delta: string) => void;
+	onToolCallDelta?: (toolCalls: ToolCall[]) => void;
+	signal?: AbortSignal;
+	/** Optional non-streaming fallback (e.g. Obsidian requestUrl to bypass CORS). */
+	fallbackPost?: (url: string, headers: Record<string, string>, body: string) => Promise<{ status: number; body: string }>;
+}
+
+interface AssistantTurn {
+	content: string | null;
+	reasoning: string | null;
+	toolCalls: ToolCall[];
+}
+
+/** One round-trip against /chat/completions. Streams if possible, falls back to non-streaming. */
+export async function chatCompletion(cfg: ChatRequestConfig, messages: ChatMessage[], tools: ToolDef[], h: StreamHandlers): Promise<AssistantTurn> {
+	const url = cfg.baseUrl.replace(/\/+$/, '') + '/chat/completions';
+	const headers: Record<string, string> = {
+		'Content-Type': 'application/json',
+		Authorization: 'Bearer ' + cfg.apiKey
+	};
+	const body = JSON.stringify({
+		model: cfg.model,
+		messages,
+		temperature: cfg.temperature ?? 0.7,
+		max_tokens: cfg.maxTokens ?? 8192,
+		stream: true,
+		tools: tools.length
+			? tools.map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }))
+			: undefined
+	});
+
+	const turn: AssistantTurn = { content: null, reasoning: null, toolCalls: [] };
+	try {
+		const res = await fetch(url, {
+			method: 'POST',
+			headers,
+			body,
+			signal: h.signal
+		});
+		if (!res.ok) {
+			const errText = await res.text().catch(() => '');
+			throw new Error(`HTTP ${res.status}: ${truncate(errText, 500)}`);
+		}
+		if (!res.body) throw new Error('empty response body');
+		await consumeSse(res.body, (payload) => applyChunk(payload, turn, h));
+	} catch (e) {
+		// Network/CORS/unsupported-stream failures: retry once without streaming.
+		if (h.fallbackPost && !(h.signal?.aborted)) {
+			const out = await h.fallbackPost(url, headers, JSON.stringify({ ...JSON.parse(body), stream: false }));
+			if (out.status >= 400) throw new Error(`HTTP ${out.status}: ${truncate(out.body, 500)}`);
+			applyChunk(JSON.stringify(out.body ? JSON.parse(out.body) : {}), turn, h, true);
+		} else {
+			throw e;
+		}
+	}
+	return turn;
+}
+
+function applyChunk(payload: string, turn: AssistantTurn, h: StreamHandlers, nonStream = false): void {
+	if (!payload || payload === '[DONE]') return;
+	let data: any;
+	try {
+		data = JSON.parse(payload);
+	} catch {
+		return;
+	}
+	const choice = data.choices?.[0];
+	if (!choice) return;
+	const delta = nonStream ? { ...choice.message } : choice.delta ?? {};
+	if (typeof delta.content === 'string' && delta.content.length) {
+		turn.content = (turn.content ?? '') + delta.content;
+		h.onText?.(delta.content);
+	}
+	if (typeof delta.reasoning_content === 'string' && delta.reasoning_content.length) {
+		turn.reasoning = (turn.reasoning ?? '') + delta.reasoning_content;
+		h.onReasoning?.(delta.reasoning_content);
+	}
+	if (Array.isArray(delta.tool_calls)) {
+		for (const tc of delta.tool_calls) {
+			const idx: number = tc.index ?? 0;
+			let target = turn.toolCalls[idx];
+			if (!target) {
+				target = { id: tc.id ?? '', type: 'function', function: { name: tc.function?.name ?? '', arguments: '' } };
+				turn.toolCalls[idx] = target;
+			}
+			if (tc.id) target.id = tc.id;
+			if (tc.function?.name) target.function.name = tc.function.name;
+			if (tc.function?.arguments) target.function.arguments += tc.function.arguments;
+		}
+		h.onToolCallDelta?.(turn.toolCalls.filter(Boolean));
+	}
+}
+
+/** Read an SSE body stream, invoking cb for every `data:` payload. */
+export async function consumeSse(body: ReadableStream<Uint8Array>, cb: (payload: string) => void): Promise<void> {
+	const reader = body.getReader();
+	const decoder = new TextDecoder();
+	let buf = '';
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		buf += decoder.decode(value, { stream: true });
+		let nl: number;
+		while ((nl = buf.indexOf('\n')) >= 0) {
+			const line = buf.slice(0, nl).replace(/\r$/, '');
+			buf = buf.slice(nl + 1);
+			if (line.startsWith('data:')) cb(line.slice(5).trim());
+		}
+	}
+	const rest = buf.trim();
+	if (rest.startsWith('data:')) cb(rest.slice(5).trim());
+}
+
+export interface ToolExecutor {
+	execute(name: string, argsJson: string): Promise<{ ok: boolean; content: string; confirmHint?: string }>;
+}
+
+export interface AgentLoopOptions extends ChatRequestConfig {
+	messages: ChatMessage[];
+	tools: ToolDef[];
+	executor: ToolExecutor;
+	maxIterations?: number;
+	confirmWrite?: (summary: string) => Promise<boolean>;
+	onText?: (delta: string) => void;
+	onReasoning?: (delta: string) => void;
+	onToolStart?: (call: ToolCall) => void;
+	onToolDone?: (call: ToolCall, result: { ok: boolean; content: string }) => void;
+	signal?: AbortSignal;
+	fallbackPost?: StreamHandlers['fallbackPost'];
+}
+
+/**
+ * Agentic loop: chat → (tool calls → execute → feed results) → repeat → final text.
+ * Returns the final assistant text (empty if the loop hit its iteration cap mid-flight).
+ */
+export async function runAgentLoop(opts: AgentLoopOptions): Promise<{ text: string; hitCap: boolean }> {
+	const maxIter = opts.maxIterations ?? 12;
+	let hitCap = false;
+	for (let i = 0; i < maxIter; i++) {
+		const turn = await chatCompletion(opts, opts.messages, opts.tools, {
+			onText: opts.onText,
+			onReasoning: opts.onReasoning,
+			signal: opts.signal,
+			fallbackPost: opts.fallbackPost
+		});
+		const calls = turn.toolCalls.filter(Boolean);
+		if (!calls.length) {
+			return { text: turn.content ?? turn.reasoning ?? '', hitCap: false };
+		}
+		opts.messages.push({
+			role: 'assistant',
+			content: turn.content ?? null,
+			tool_calls: calls
+		});
+		for (const call of calls) {
+			opts.onToolStart?.(call);
+			let result = { ok: false, content: 'blocked before execution' };
+			try {
+				const args = JSON.parse(call.function.arguments || '{}');
+				// Write actions may require explicit user confirmation.
+				const def = opts.tools.find(t => t.name === call.function.name);
+				if (def?.x_write && opts.confirmWrite && !(await opts.confirmWrite(`${call.function.name}: ${truncate(JSON.stringify(args), 200)}`))) {
+					result = { ok: false, content: 'USER_DENIED' };
+				} else {
+					result = await opts.executor.execute(call.function.name, call.function.arguments);
+				}
+			} catch (e) {
+				result = { ok: false, content: 'tool error: ' + (e instanceof Error ? e.message : String(e)) };
+			}
+			opts.onToolDone?.(call, result);
+			opts.messages.push({
+				role: 'tool',
+				tool_call_id: call.id,
+				content: truncate(result.content, 20000)
+			});
+		}
+		hitCap = true; // stays true only if we exhaust the loop below
+	}
+	return { text: '', hitCap };
+}
+
+export function truncate(s: string, n: number): string {
+	if (s.length <= n) return s;
+	return s.slice(0, n) + `… [truncated, ${s.length} chars total]`;
+}

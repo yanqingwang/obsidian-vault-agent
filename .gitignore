@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.hot-update.js
+*.map
+.hot
+.DS_Store
