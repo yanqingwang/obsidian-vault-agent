@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, requestUrl, WorkspaceLeaf } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, requestUrl, WorkspaceLeaf, type SettingDefinitionItem } from 'obsidian';
 import { AgentView, VIEW_TYPE_AGENT } from './view';
 import { t, Lang } from './i18n';
 
@@ -63,7 +63,7 @@ export default class VaultAgentPlugin extends Plugin {
 		await this.loadSettings();
 		this.registerView(VIEW_TYPE_AGENT, (leaf: WorkspaceLeaf) => new AgentView(leaf, this));
 		this.addRibbonIcon('bot-message-square', t(this.settings.lang, 'viewName'), () => void this.revealAgent());
-		this.addCommand({ id: 'open-agent', name: '打开智能体 / Open agent', callback: () => void this.revealAgent() });
+		this.addCommand({ id: 'open-agent', name: '打开智能体 / open agent', callback: () => void this.revealAgent() });
 		this.addSettingTab(new VASettingTab(this.app, this));
 	}
 
@@ -126,6 +126,115 @@ class VASettingTab extends PluginSettingTab {
 
 	private st(key: Parameters<typeof t>[1]): string { return t(this.plugin.settings.lang, key); }
 
+	/**
+	 * Declarative settings (Obsidian 1.13+): makes settings searchable.
+	 * display() below still renders for older Obsidian versions.
+	 */
+	getSettingDefinitions(): SettingDefinitionItem[] {
+		const s = this.plugin.settings;
+		const providerHint = PROVIDERS.find(p => p.id === s.providerId)?.hint;
+		return [
+			{
+				name: this.st('language'),
+				desc: this.st('languageDesc'),
+				control: { type: 'dropdown', key: 'lang', options: { zh: '中文', en: 'English' } }
+			},
+			{
+				name: this.st('provider'),
+				desc: this.st('providerDesc') + (providerHint ? '\nℹ️ ' + providerHint : ''),
+				control: { type: 'dropdown', key: 'providerId', options: Object.fromEntries(PROVIDERS.map(p => [p.id, p.label])) }
+			},
+			{
+				name: this.st('baseUrl'),
+				control: { type: 'text', key: 'baseUrl', placeholder: 'https://api.example.com/v1' }
+			},
+			{
+				name: this.st('apiKey'),
+				desc: this.st('apiKeyDesc'),
+				control: { type: 'text', key: 'apiKey', placeholder: 'sk-…' }
+			},
+			{
+				name: this.st('model'),
+				desc: this.st('modelDesc'),
+				control: { type: 'text', key: 'model' }
+			},
+			{
+				name: this.st('modelPreset'),
+				searchable: false,
+				visible: () => !!(PROVIDERS.find(p => p.id === this.plugin.settings.providerId)?.models.length),
+				render: (setting) => {
+					const preset = PROVIDERS.find(p => p.id === this.plugin.settings.providerId);
+					for (const m of preset?.models ?? []) {
+						const btn = setting.controlEl.createEl('button', { text: m });
+						if (m === this.plugin.settings.model) btn.addClass('va-chip-active');
+						btn.addEventListener('click', () => {
+							this.plugin.settings.model = m;
+							void this.plugin.saveSettings();
+							setting.controlEl.querySelectorAll('button').forEach(b => b.removeClass('va-chip-active'));
+							btn.addClass('va-chip-active');
+						});
+					}
+					return () => setting.controlEl.empty();
+				}
+			},
+			{
+				name: this.st('temperature'),
+				control: { type: 'slider', key: 'temperature', min: 0, max: 2, step: 0.1 }
+			},
+			{
+				name: this.st('maxTokens'),
+				control: {
+					type: 'number',
+					key: 'maxTokens',
+					step: 1,
+					validate: (v) => (typeof v === 'number' && v > 0 ? undefined : 'must be a positive number')
+				}
+			},
+			{
+				name: this.st('maxIterations'),
+				control: {
+					type: 'number',
+					key: 'maxIterations',
+					step: 1,
+					validate: (v) => (typeof v === 'number' && v > 0 ? undefined : 'must be a positive number')
+				}
+			},
+			{
+				name: this.st('autoContext'),
+				desc: this.st('autoContextDesc'),
+				control: { type: 'toggle', key: 'autoContext' }
+			},
+			{
+				name: this.st('autoApprove'),
+				desc: this.st('autoApproveDesc'),
+				control: { type: 'toggle', key: 'autoApprove' }
+			},
+			{
+				name: this.st('systemPrompt'),
+				desc: this.st('systemPromptDesc'),
+				control: { type: 'textarea', key: 'systemPrompt', rows: 4 }
+			}
+		];
+	}
+
+	override getControlValue(key: string): unknown {
+		return (this.plugin.settings as unknown as Record<string, unknown>)[key];
+	}
+
+	override async setControlValue(key: string, value: unknown): Promise<void> {
+		const s = this.plugin.settings;
+		(s as unknown as Record<string, unknown>)[key] = value;
+		if (key === 'providerId' && typeof value === 'string') {
+			// Switching provider refreshes the base URL and default model.
+			const preset = PROVIDERS.find(p => p.id === value);
+			if (preset) {
+				s.baseUrl = preset.baseUrl;
+				if (preset.models.length) s.model = preset.models[0];
+			}
+		}
+		await this.plugin.saveSettings();
+	}
+
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
@@ -140,7 +249,7 @@ class VASettingTab extends PluginSettingTab {
 				.addOption('zh', '中文')
 				.addOption('en', 'English')
 				.setValue(s.lang)
-				.onChange(async v => { s.lang = v as Lang; await this.plugin.saveSettings(); this.display(); }));
+				.onChange(async v => { s.lang = v as Lang; await this.plugin.saveSettings(); }));
 
 		const providerNames = PROVIDERS.map(p => [p.id, p.label] as [string, string]);
 		new Setting(containerEl)
@@ -156,18 +265,11 @@ class VASettingTab extends PluginSettingTab {
 					}
 					s.providerId = v;
 					await this.plugin.saveSettings();
-					this.display();
+					this.renderProviderExtras(containerEl);
 				});
 			});
 
-		const preset = PROVIDERS.find(p => p.id === s.providerId);
-		if (preset?.hint) {
-			const hint = new Setting(containerEl).setClass('va-hint');
-			hint.nameEl.setText('ℹ️ ' + preset.hint);
-		}
-
 		new Setting(containerEl).setName(this.st('baseUrl')).addText(tx => tx
-			.setPlaceholder('https://api.example.com/v1')
 			.setValue(s.baseUrl)
 			.onChange(async v => { s.baseUrl = v.trim(); await this.plugin.saveSettings(); }));
 
@@ -176,8 +278,7 @@ class VASettingTab extends PluginSettingTab {
 			.setDesc(this.st('apiKeyDesc'))
 			.addText(tx => {
 				tx.inputEl.type = 'password';
-				tx.setPlaceholder('sk-…')
-					.setValue(s.apiKey)
+				tx.setValue(s.apiKey)
 					.onChange(async v => { s.apiKey = v.trim(); await this.plugin.saveSettings(); });
 			});
 
@@ -188,15 +289,7 @@ class VASettingTab extends PluginSettingTab {
 			.setValue(s.model)
 			.onChange(async v => { s.model = v.trim(); await this.plugin.saveSettings(); }));
 
-		if (preset?.models.length) {
-			const presets = new Setting(containerEl).setName(this.st('modelPreset')).setClass('va-model-chips');
-			for (const m of preset.models) {
-				presets.addButton(b => b
-					.setButtonText(m)
-					.setClass(s.model === m ? 'va-chip-active' : '')
-					.onClick(async () => { s.model = m; await this.plugin.saveSettings(); this.display(); }));
-			}
-		}
+		this.renderProviderExtras(containerEl);
 
 		new Setting(containerEl).setName(this.st('temperature'))
 			.addSlider(sl => sl.setLimits(0, 2, 0.1).setValue(s.temperature)
@@ -228,5 +321,31 @@ class VASettingTab extends PluginSettingTab {
 			.setName(this.st('systemPrompt'))
 			.setDesc(this.st('systemPromptDesc'))
 			.addTextArea(ta => ta.setValue(s.systemPrompt).onChange(async v => { s.systemPrompt = v; await this.plugin.saveSettings(); }));
+	}
+
+	/** Provider hint + model preset chips; re-rendered in place when the provider changes. */
+	private renderProviderExtras(containerEl: HTMLElement): void {
+		const s = this.plugin.settings;
+		const preset = PROVIDERS.find(p => p.id === s.providerId);
+
+		if (preset?.hint) {
+			const hint = new Setting(containerEl).setClass('va-hint');
+			hint.nameEl.setText('ℹ️ ' + preset.hint);
+		}
+
+		if (!preset?.models.length) return;
+		const presets = new Setting(containerEl).setName(this.st('modelPreset')).setClass('va-model-chips');
+		for (const m of preset.models) {
+			presets.addButton(b => {
+				b.setButtonText(m);
+				if (s.model === m) b.buttonEl.addClass('va-chip-active');
+				b.onClick(async () => {
+					s.model = m;
+					await this.plugin.saveSettings();
+					presets.controlEl.querySelectorAll('button').forEach(el => el.removeClass('va-chip-active'));
+					b.buttonEl.addClass('va-chip-active');
+				});
+			});
+		}
 	}
 }

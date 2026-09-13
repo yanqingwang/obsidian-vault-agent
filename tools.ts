@@ -114,7 +114,14 @@ export class VaultToolExecutor implements ToolExecutor {
 		const args = parsed !== null && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
 		const s = (key: string, fallback = ''): string => {
 			const v = args[key];
-			return typeof v === 'string' ? v : v === undefined || v === null ? fallback : String(v);
+			switch (typeof v) {
+				case 'string': return v;
+				case 'number':
+				case 'bigint':
+				case 'boolean': return String(v);
+				case 'object': return v !== null ? JSON.stringify(v) : fallback;
+				default: return fallback;
+			}
 		};
 		const b = (key: string): boolean => args[key] === true;
 		try {

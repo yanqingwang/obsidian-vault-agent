@@ -84,6 +84,7 @@ const { text, hitCap } = await runAgentLoop({
 	],
 	executor,
 	confirmWrite,
+	fetchImpl: fetch,
 	maxIterations: 5,
 	onText: d => streamed += d
 });
@@ -115,17 +116,18 @@ server.on('request', (req, res) => {
 	});
 });
 const messages2 = [{ role: 'user', content: 'again' }];
-await runAgentLoop({
-	baseUrl: `http://127.0.0.1:${port}`,
-	apiKey: 'sk-test',
-	model: 'test-model',
-	messages: messages2,
-	tools: [{ name: 'create_note', description: 'c', parameters: { type: 'object', properties: {} }, x_write: true }],
-	executor,
-	confirmWrite,
-	maxIterations: 3,
-	onText: () => {}
-});
+	await runAgentLoop({
+		baseUrl: `http://127.0.0.1:${port}`,
+		apiKey: 'sk-test',
+		model: 'test-model',
+		messages: messages2,
+		tools: [{ name: 'create_note', description: 'c', parameters: { type: 'object', properties: {} }, x_write: true }],
+		executor,
+		confirmWrite,
+		fetchImpl: fetch,
+		maxIterations: 3,
+		onText: () => {}
+	});
 const deniedMsg = messages2.find(m => m.role === 'tool');
 assert.ok(deniedMsg && deniedMsg.content === 'USER_DENIED', 'denial fed back to model');
 assert.equal(executed.length, 1, 'executor not called when denied');

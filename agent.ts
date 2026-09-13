@@ -37,6 +37,8 @@ export interface StreamHandlers {
 	onReasoning?: (delta: string) => void;
 	onToolCallDelta?: (toolCalls: ToolCall[]) => void;
 	signal?: AbortSignal;
+	/** Platform fetch implementation (pass `window.fetch.bind(window)` from the plugin; Node tests pass global fetch). */
+	fetchImpl?: typeof fetch;
 	/** Optional non-streaming fallback (e.g. Obsidian requestUrl to bypass CORS). */
 	fallbackPost?: (url: string, headers: Record<string, string>, body: string) => Promise<{ status: number; body: string }>;
 }
@@ -68,9 +70,10 @@ export async function chatCompletion(cfg: ChatRequestConfig, messages: ChatMessa
 
 	const turn: AssistantTurn = { content: null, reasoning: null, toolCalls: [] };
 	try {
-		// Obsidian's requestUrl cannot stream responses; SSE streaming requires fetch.
-		// eslint-disable-next-line
-		const res = await fetch(url, {
+		// Obsidian's requestUrl cannot stream responses, so streaming goes through the
+		// platform fetch implementation injected by the host (window.fetch in the plugin).
+		if (!h.fetchImpl) throw new Error('no streaming fetch implementation provided');
+		const res = await h.fetchImpl(url, {
 			method: 'POST',
 			headers,
 			body,
@@ -183,6 +186,7 @@ export interface AgentLoopOptions extends ChatRequestConfig {
 	onToolStart?: (call: ToolCall) => void;
 	onToolDone?: (call: ToolCall, result: { ok: boolean; content: string }) => void;
 	signal?: AbortSignal;
+	fetchImpl?: typeof fetch;
 	fallbackPost?: StreamHandlers['fallbackPost'];
 }
 
@@ -198,6 +202,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<{ text: stri
 			onText: opts.onText,
 			onReasoning: opts.onReasoning,
 			signal: opts.signal,
+			fetchImpl: opts.fetchImpl,
 			fallbackPost: opts.fallbackPost
 		});
 		const calls = turn.toolCalls.filter(Boolean);
@@ -213,7 +218,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<{ text: stri
 			opts.onToolStart?.(call);
 			let result = { ok: false, content: 'blocked before execution' };
 			try {
-				const args = JSON.parse(call.function.arguments || '{}');
+				const args: unknown = JSON.parse(call.function.arguments || '{}');
 				// Write actions may require explicit user confirmation.
 				const def = opts.tools.find(t => t.name === call.function.name);
 				if (def?.x_write && opts.confirmWrite && !(await opts.confirmWrite(`${call.function.name}: ${truncate(JSON.stringify(args), 200)}`))) {

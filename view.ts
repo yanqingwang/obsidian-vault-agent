@@ -233,6 +233,7 @@ export class AgentView extends ItemView {
 		const executor = new VaultToolExecutor(this.app, () => this.app.workspace.getActiveFile()?.path ?? null);
 
 		try {
+			const fetchImpl: typeof fetch = (url, init) => window.fetch(url, init);
 			const { text, hitCap } = await runAgentLoop({
 				baseUrl: s.baseUrl,
 				apiKey: s.apiKey,
@@ -245,7 +246,8 @@ export class AgentView extends ItemView {
 				executor,
 				signal: this.abort.signal,
 				confirmWrite: (summary) => this.confirmWrite(summary),
-				fallbackPost: this.plugin.fallbackPost.bind(this.plugin),
+				fetchImpl,
+				fallbackPost: (url, headers, body) => this.plugin.fallbackPost(url, headers, body),
 				onText: d => stream.push(d),
 				onToolStart: call => this.addToolChip(call),
 				onToolDone: (call, result) => this.addToolChip(call, result)
@@ -253,7 +255,7 @@ export class AgentView extends ItemView {
 			stream.finish(text);
 			if (hitCap) new Notice(this.st('maxIterReached'));
 			this.messages.push({ role: 'assistant', content: text });
-		} catch (e) {
+		} catch (e: unknown) {
 			const aborted = this.abort.signal.aborted;
 			const msg = aborted ? (s.lang === 'zh' ? '（已停止）' : '(stopped)') : `${this.st('errPrefix')}: ${e instanceof Error ? e.message : String(e)}`;
 			stream.finish(msg);

@@ -51,7 +51,9 @@ async function chatCompletion(cfg, messages, tools, h) {
   const body = JSON.stringify(payload);
   const turn = { content: null, reasoning: null, toolCalls: [] };
   try {
-    const res = await fetch(url, {
+    if (!h.fetchImpl)
+      throw new Error("no streaming fetch implementation provided");
+    const res = await h.fetchImpl(url, {
       method: "POST",
       headers,
       body,
@@ -163,6 +165,7 @@ async function runAgentLoop(opts) {
       onText: opts.onText,
       onReasoning: opts.onReasoning,
       signal: opts.signal,
+      fetchImpl: opts.fetchImpl,
       fallbackPost: opts.fallbackPost
     });
     const calls = turn.toolCalls.filter(Boolean);
@@ -409,7 +412,18 @@ var VaultToolExecutor = class {
     const args = parsed !== null && typeof parsed === "object" ? parsed : {};
     const s = (key, fallback = "") => {
       const v = args[key];
-      return typeof v === "string" ? v : v === void 0 || v === null ? fallback : String(v);
+      switch (typeof v) {
+        case "string":
+          return v;
+        case "number":
+        case "bigint":
+        case "boolean":
+          return String(v);
+        case "object":
+          return v !== null ? JSON.stringify(v) : fallback;
+        default:
+          return fallback;
+      }
     };
     const b = (key) => args[key] === true;
     try {
@@ -802,6 +816,7 @@ var AgentView = class extends import_obsidian2.ItemView {
     const tools = buildToolDefs();
     const executor = new VaultToolExecutor(this.app, () => this.app.workspace.getActiveFile()?.path ?? null);
     try {
+      const fetchImpl = (url, init) => window.fetch(url, init);
       const { text, hitCap } = await runAgentLoop({
         baseUrl: s.baseUrl,
         apiKey: s.apiKey,
@@ -814,7 +829,8 @@ var AgentView = class extends import_obsidian2.ItemView {
         executor,
         signal: this.abort.signal,
         confirmWrite: (summary) => this.confirmWrite(summary),
-        fallbackPost: this.plugin.fallbackPost.bind(this.plugin),
+        fetchImpl,
+        fallbackPost: (url, headers, body) => this.plugin.fallbackPost(url, headers, body),
         onText: (d) => stream.push(d),
         onToolStart: (call) => this.addToolChip(call),
         onToolDone: (call, result) => this.addToolChip(call, result)
@@ -874,7 +890,7 @@ var VaultAgentPlugin = class extends import_obsidian3.Plugin {
     await this.loadSettings();
     this.registerView(VIEW_TYPE_AGENT, (leaf) => new AgentView(leaf, this));
     this.addRibbonIcon("bot-message-square", t(this.settings.lang, "viewName"), () => void this.revealAgent());
-    this.addCommand({ id: "open-agent", name: "\u6253\u5F00\u667A\u80FD\u4F53 / Open agent", callback: () => void this.revealAgent() });
+    this.addCommand({ id: "open-agent", name: "\u6253\u5F00\u667A\u80FD\u4F53 / open agent", callback: () => void this.revealAgent() });
     this.addSettingTab(new VASettingTab(this.app, this));
   }
   onunload() {
@@ -927,6 +943,113 @@ var VASettingTab = class extends import_obsidian3.PluginSettingTab {
   st(key) {
     return t(this.plugin.settings.lang, key);
   }
+  /**
+   * Declarative settings (Obsidian 1.13+): makes settings searchable.
+   * display() below still renders for older Obsidian versions.
+   */
+  getSettingDefinitions() {
+    const s = this.plugin.settings;
+    const providerHint = PROVIDERS.find((p) => p.id === s.providerId)?.hint;
+    return [
+      {
+        name: this.st("language"),
+        desc: this.st("languageDesc"),
+        control: { type: "dropdown", key: "lang", options: { zh: "\u4E2D\u6587", en: "English" } }
+      },
+      {
+        name: this.st("provider"),
+        desc: this.st("providerDesc") + (providerHint ? "\n\u2139\uFE0F " + providerHint : ""),
+        control: { type: "dropdown", key: "providerId", options: Object.fromEntries(PROVIDERS.map((p) => [p.id, p.label])) }
+      },
+      {
+        name: this.st("baseUrl"),
+        control: { type: "text", key: "baseUrl", placeholder: "https://api.example.com/v1" }
+      },
+      {
+        name: this.st("apiKey"),
+        desc: this.st("apiKeyDesc"),
+        control: { type: "text", key: "apiKey", placeholder: "sk-\u2026" }
+      },
+      {
+        name: this.st("model"),
+        desc: this.st("modelDesc"),
+        control: { type: "text", key: "model" }
+      },
+      {
+        name: this.st("modelPreset"),
+        searchable: false,
+        visible: () => !!PROVIDERS.find((p) => p.id === this.plugin.settings.providerId)?.models.length,
+        render: (setting) => {
+          const preset = PROVIDERS.find((p) => p.id === this.plugin.settings.providerId);
+          for (const m of preset?.models ?? []) {
+            const btn = setting.controlEl.createEl("button", { text: m });
+            if (m === this.plugin.settings.model)
+              btn.addClass("va-chip-active");
+            btn.addEventListener("click", () => {
+              this.plugin.settings.model = m;
+              void this.plugin.saveSettings();
+              setting.controlEl.querySelectorAll("button").forEach((b) => b.removeClass("va-chip-active"));
+              btn.addClass("va-chip-active");
+            });
+          }
+          return () => setting.controlEl.empty();
+        }
+      },
+      {
+        name: this.st("temperature"),
+        control: { type: "slider", key: "temperature", min: 0, max: 2, step: 0.1 }
+      },
+      {
+        name: this.st("maxTokens"),
+        control: {
+          type: "number",
+          key: "maxTokens",
+          step: 1,
+          validate: (v) => typeof v === "number" && v > 0 ? void 0 : "must be a positive number"
+        }
+      },
+      {
+        name: this.st("maxIterations"),
+        control: {
+          type: "number",
+          key: "maxIterations",
+          step: 1,
+          validate: (v) => typeof v === "number" && v > 0 ? void 0 : "must be a positive number"
+        }
+      },
+      {
+        name: this.st("autoContext"),
+        desc: this.st("autoContextDesc"),
+        control: { type: "toggle", key: "autoContext" }
+      },
+      {
+        name: this.st("autoApprove"),
+        desc: this.st("autoApproveDesc"),
+        control: { type: "toggle", key: "autoApprove" }
+      },
+      {
+        name: this.st("systemPrompt"),
+        desc: this.st("systemPromptDesc"),
+        control: { type: "textarea", key: "systemPrompt", rows: 4 }
+      }
+    ];
+  }
+  getControlValue(key) {
+    return this.plugin.settings[key];
+  }
+  async setControlValue(key, value) {
+    const s = this.plugin.settings;
+    s[key] = value;
+    if (key === "providerId" && typeof value === "string") {
+      const preset = PROVIDERS.find((p) => p.id === value);
+      if (preset) {
+        s.baseUrl = preset.baseUrl;
+        if (preset.models.length)
+          s.model = preset.models[0];
+      }
+    }
+    await this.plugin.saveSettings();
+  }
   display() {
     const { containerEl } = this;
     containerEl.empty();
@@ -935,36 +1058,30 @@ var VASettingTab = class extends import_obsidian3.PluginSettingTab {
     new import_obsidian3.Setting(containerEl).setName(this.st("language")).setDesc(this.st("languageDesc")).addDropdown((d) => d.addOption("zh", "\u4E2D\u6587").addOption("en", "English").setValue(s.lang).onChange(async (v) => {
       s.lang = v;
       await this.plugin.saveSettings();
-      this.display();
     }));
     const providerNames = PROVIDERS.map((p) => [p.id, p.label]);
     new import_obsidian3.Setting(containerEl).setName(this.st("provider")).setDesc(this.st("providerDesc")).addDropdown((d) => {
       for (const [id, label] of providerNames)
         d.addOption(id, label);
       d.setValue(s.providerId).onChange(async (v) => {
-        const preset2 = PROVIDERS.find((p) => p.id === v);
-        if (preset2) {
-          s.baseUrl = preset2.baseUrl;
-          if (preset2.models.length)
-            s.model = preset2.models[0];
+        const preset = PROVIDERS.find((p) => p.id === v);
+        if (preset) {
+          s.baseUrl = preset.baseUrl;
+          if (preset.models.length)
+            s.model = preset.models[0];
         }
         s.providerId = v;
         await this.plugin.saveSettings();
-        this.display();
+        this.renderProviderExtras(containerEl);
       });
     });
-    const preset = PROVIDERS.find((p) => p.id === s.providerId);
-    if (preset?.hint) {
-      const hint = new import_obsidian3.Setting(containerEl).setClass("va-hint");
-      hint.nameEl.setText("\u2139\uFE0F " + preset.hint);
-    }
-    new import_obsidian3.Setting(containerEl).setName(this.st("baseUrl")).addText((tx) => tx.setPlaceholder("https://api.example.com/v1").setValue(s.baseUrl).onChange(async (v) => {
+    new import_obsidian3.Setting(containerEl).setName(this.st("baseUrl")).addText((tx) => tx.setValue(s.baseUrl).onChange(async (v) => {
       s.baseUrl = v.trim();
       await this.plugin.saveSettings();
     }));
     new import_obsidian3.Setting(containerEl).setName(this.st("apiKey")).setDesc(this.st("apiKeyDesc")).addText((tx) => {
       tx.inputEl.type = "password";
-      tx.setPlaceholder("sk-\u2026").setValue(s.apiKey).onChange(async (v) => {
+      tx.setValue(s.apiKey).onChange(async (v) => {
         s.apiKey = v.trim();
         await this.plugin.saveSettings();
       });
@@ -974,16 +1091,7 @@ var VASettingTab = class extends import_obsidian3.PluginSettingTab {
       s.model = v.trim();
       await this.plugin.saveSettings();
     }));
-    if (preset?.models.length) {
-      const presets = new import_obsidian3.Setting(containerEl).setName(this.st("modelPreset")).setClass("va-model-chips");
-      for (const m of preset.models) {
-        presets.addButton((b) => b.setButtonText(m).setClass(s.model === m ? "va-chip-active" : "").onClick(async () => {
-          s.model = m;
-          await this.plugin.saveSettings();
-          this.display();
-        }));
-      }
-    }
+    this.renderProviderExtras(containerEl);
     new import_obsidian3.Setting(containerEl).setName(this.st("temperature")).addSlider((sl) => sl.setLimits(0, 2, 0.1).setValue(s.temperature).onChange(async (v) => {
       s.temperature = v;
       await this.plugin.saveSettings();
@@ -1014,5 +1122,30 @@ var VASettingTab = class extends import_obsidian3.PluginSettingTab {
       s.systemPrompt = v;
       await this.plugin.saveSettings();
     }));
+  }
+  /** Provider hint + model preset chips; re-rendered in place when the provider changes. */
+  renderProviderExtras(containerEl) {
+    const s = this.plugin.settings;
+    const preset = PROVIDERS.find((p) => p.id === s.providerId);
+    if (preset?.hint) {
+      const hint = new import_obsidian3.Setting(containerEl).setClass("va-hint");
+      hint.nameEl.setText("\u2139\uFE0F " + preset.hint);
+    }
+    if (!preset?.models.length)
+      return;
+    const presets = new import_obsidian3.Setting(containerEl).setName(this.st("modelPreset")).setClass("va-model-chips");
+    for (const m of preset.models) {
+      presets.addButton((b) => {
+        b.setButtonText(m);
+        if (s.model === m)
+          b.buttonEl.addClass("va-chip-active");
+        b.onClick(async () => {
+          s.model = m;
+          await this.plugin.saveSettings();
+          presets.controlEl.querySelectorAll("button").forEach((el) => el.removeClass("va-chip-active"));
+          b.buttonEl.addClass("va-chip-active");
+        });
+      });
+    }
   }
 };
