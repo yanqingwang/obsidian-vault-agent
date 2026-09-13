@@ -20,7 +20,7 @@ await build({
 	format: 'esm',
 	platform: 'node'
 });
-const { runAgentLoop } = await import(pathToFileURL(out).href);
+const { runAgentLoop, normalizeReasoning } = await import(pathToFileURL(out).href);
 
 // 2. Mock server: turn 1 streams a create_note tool call; turn 2 streams the final answer.
 const seenBodies = [];
@@ -38,6 +38,8 @@ const server = http.createServer((req, res) => {
 		res.writeHead(200, { 'Content-Type': 'text/event-stream' });
 		if (seenBodies.length === 1) {
 			res.end(sse([
+				{ reasoning_content: 'let me ' },
+				{ reasoning_content: 'think.\n\n\n\nstep 2:   ' },
 				{ content: '我先建个笔记。' },
 				{ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'create_note', arguments: '{"path":"Notes/A' } }] },
 				{ tool_calls: [{ index: 0, function: { arguments: 'bc.md","content":"# Hello' } }] },
@@ -73,7 +75,8 @@ const messages = [
 	{ role: 'user', content: '请创建笔记 Notes/Abc.md' }
 ];
 let streamed = '';
-const { text, hitCap } = await runAgentLoop({
+let reasoningStreamed = '';
+const { text, hitCap, reasoning } = await runAgentLoop({
 	baseUrl: `http://127.0.0.1:${port}`,
 	apiKey: 'sk-test',
 	model: 'test-model',
@@ -86,13 +89,18 @@ const { text, hitCap } = await runAgentLoop({
 	confirmWrite,
 	fetchImpl: fetch,
 	maxIterations: 5,
-	onText: d => streamed += d
+	onText: d => streamed += d,
+	onReasoning: d => reasoningStreamed += d
 });
 
 // 5. Assertions.
 assert.equal(executed.length, 1, 'executor ran once');
 assert.deepEqual(executed[0].args, { path: 'Notes/Abc.md', content: '# Hello world' }, 'streamed tool args reassembled');
-assert.equal(text, '笔记创建完成 ✅', 'final text');
+assert.equal(text, '笔记创建完成 ✅', 'final text is the content, not the reasoning');
+assert.equal(reasoningStreamed, 'let me think.\n\n\n\nstep 2:   ', 'reasoning deltas pass through verbatim (no injected newlines)');
+assert.equal(reasoning, 'let me think.\n\n\n\nstep 2:   ', 'loop returns reasoning');
+assert.equal(normalizeReasoning(reasoningStreamed), 'let me think.\n\nstep 2:', 'normalizeReasoning collapses blank-line runs');
+assert.equal(normalizeReasoning('  a \n\n\n\n\n b\n'), 'a\n\nb', 'normalizeReasoning trims edges');
 assert.equal(hitCap, false);
 assert.equal(confirmations.length, 1, 'write tool asked for confirmation');
 assert.ok(streamed.includes('我先建个笔记。'), 'streaming saw deltas');

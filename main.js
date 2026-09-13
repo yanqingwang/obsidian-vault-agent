@@ -160,6 +160,7 @@ async function consumeSse(body, cb) {
 async function runAgentLoop(opts) {
   const maxIter = opts.maxIterations ?? 12;
   let hitCap = false;
+  let reasoning = "";
   for (let i = 0; i < maxIter; i++) {
     const turn = await chatCompletion(opts, opts.messages, opts.tools, {
       onText: opts.onText,
@@ -168,9 +169,11 @@ async function runAgentLoop(opts) {
       fetchImpl: opts.fetchImpl,
       fallbackPost: opts.fallbackPost
     });
+    if (turn.reasoning)
+      reasoning += (reasoning ? "\n" : "") + turn.reasoning;
     const calls = turn.toolCalls.filter(Boolean);
     if (!calls.length) {
-      return { text: turn.content ?? "", reasoning: turn.reasoning ?? "", hitCap: false };
+      return { text: turn.content ?? "", reasoning, hitCap: false };
     }
     opts.messages.push({
       role: "assistant",
@@ -206,6 +209,9 @@ function truncate(s, n) {
   if (s.length <= n)
     return s;
   return s.slice(0, n) + `\u2026 [truncated, ${s.length} chars total]`;
+}
+function normalizeReasoning(text) {
+  return text.replace(/\r\n?/g, "\n").replace(/[ \t]+/g, " ").replace(/ ?\n ?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 // i18n.ts
@@ -757,11 +763,9 @@ var AgentView = class extends import_obsidian2.ItemView {
           el.insertBefore(d, textEl);
           reasoningEl = d;
         }
-        if (reasoningAcc && delta)
-          reasoningAcc += "\n";
         reasoningAcc += delta;
         if (reasoningTextEl) {
-          reasoningTextEl.textContent = reasoningAcc;
+          reasoningTextEl.textContent = normalizeReasoning(reasoningAcc);
           reasoningTextEl.scrollTop = reasoningTextEl.scrollHeight;
         }
         this.scrollBottom();
@@ -769,7 +773,7 @@ var AgentView = class extends import_obsidian2.ItemView {
       finish: (full, reasoning) => {
         el.removeClass("va-streaming");
         textEl.remove();
-        const finalReasoning = (reasoning || reasoningAcc).trim();
+        const finalReasoning = normalizeReasoning(reasoning || reasoningAcc);
         if (finalReasoning) {
           if (!reasoningEl) {
             reasoningEl = el.createEl("details", { cls: "va-reasoning" });

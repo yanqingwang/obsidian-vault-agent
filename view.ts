@@ -1,5 +1,5 @@
 import { ItemView, WorkspaceLeaf, MarkdownRenderer, Notice, setIcon } from 'obsidian';
-import { ChatMessage, ToolCall, runAgentLoop, ToolDef } from './agent';
+import { ChatMessage, ToolCall, runAgentLoop, ToolDef, normalizeReasoning } from './agent';
 import { t } from './i18n';
 import { VaultToolExecutor, buildToolDefs } from './tools';
 import type VaultAgentPlugin from './main';
@@ -172,10 +172,9 @@ export class AgentView extends ItemView {
 					el.insertBefore(d, textEl);
 					reasoningEl = d;
 				}
-				if (reasoningAcc && delta) reasoningAcc += '\n';
 				reasoningAcc += delta;
 				if (reasoningTextEl) {
-					reasoningTextEl.textContent = reasoningAcc;
+					reasoningTextEl.textContent = normalizeReasoning(reasoningAcc);
 					reasoningTextEl.scrollTop = reasoningTextEl.scrollHeight;
 				}
 				this.scrollBottom();
@@ -183,7 +182,7 @@ export class AgentView extends ItemView {
 			finish: (full, reasoning) => {
 				el.removeClass('va-streaming');
 				textEl.remove();
-				const finalReasoning = (reasoning || reasoningAcc).trim();
+				const finalReasoning = normalizeReasoning(reasoning || reasoningAcc);
 				if (finalReasoning) {
 					if (!reasoningEl) {
 						reasoningEl = el.createEl('details', { cls: 'va-reasoning' });

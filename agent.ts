@@ -203,6 +203,7 @@ export interface AgentLoopResult {
 export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult> {
 	const maxIter = opts.maxIterations ?? 12;
 	let hitCap = false;
+	let reasoning = '';
 	for (let i = 0; i < maxIter; i++) {
 		const turn = await chatCompletion(opts, opts.messages, opts.tools, {
 			onText: opts.onText,
@@ -211,9 +212,10 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
 			fetchImpl: opts.fetchImpl,
 			fallbackPost: opts.fallbackPost
 		});
+		if (turn.reasoning) reasoning += (reasoning ? '\n' : '') + turn.reasoning;
 		const calls = turn.toolCalls.filter(Boolean);
 		if (!calls.length) {
-			return { text: turn.content ?? '', reasoning: turn.reasoning ?? '', hitCap: false };
+			return { text: turn.content ?? '', reasoning, hitCap: false };
 		}
 		opts.messages.push({
 			role: 'assistant',
@@ -250,4 +252,18 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
 export function truncate(s: string, n: number): string {
 	if (s.length <= n) return s;
 	return s.slice(0, n) + `… [truncated, ${s.length} chars total]`;
+}
+
+/**
+ * Normalize streamed reasoning text for display: reasoning models emit lots of
+ * stray whitespace and long runs of blank lines; collapse them without losing
+ * paragraph structure.
+ */
+export function normalizeReasoning(text: string): string {
+	return text
+		.replace(/\r\n?/g, '\n')
+		.replace(/[ \t]+/g, ' ')
+		.replace(/ ?\n ?/g, '\n')
+		.replace(/\n{3,}/g, '\n\n')
+		.trim();
 }
