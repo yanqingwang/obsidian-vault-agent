@@ -46,6 +46,13 @@ const zh = {
 	openSettings: '打开设置',
 	clearChat: '清空当前对话',
 	emptySearch: '没有匹配结果',
+	history: '历史记录',
+	historyFilter: '搜索历史对话…',
+	historyEmpty: '还没有历史记录，发一条消息后就会出现在这里。',
+	historyNoUser: '（无用户消息）',
+	historyEvents: '条事件',
+	backToChat: '返回对话',
+	historyLoaded: '已载入会话',
 } as const;
 
 type Dict = Record<keyof typeof zh, string>;
@@ -96,6 +103,13 @@ const en: Dict = {
 	openSettings: 'Open settings',
 	clearChat: 'Clear conversation',
 	emptySearch: 'No matches',
+	history: 'History',
+	historyFilter: 'Search history…',
+	historyEmpty: 'No history yet — send a message and it will show up here.',
+	historyNoUser: '(no user message)',
+	historyEvents: 'events',
+	backToChat: 'Back to chat',
+	historyLoaded: 'Loaded session',
 };
 
 export const STRINGS: Record<Lang, Dict> = { zh, en };

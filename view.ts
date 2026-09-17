@@ -1,6 +1,7 @@
 import { ItemView, WorkspaceLeaf, MarkdownRenderer, Notice, setIcon } from 'obsidian';
 import { ChatMessage, ToolCall, runAgentLoop, ToolDef, normalizeReasoning } from './agent';
 import { FetchLike, makeProxyFetch } from './proxyFetch';
+import { parseHistory, sessionCursor, sessionTranscript, summarizeSessions, type HistoryEvent } from './history';
 import { t } from './i18n';
 import { VaultToolExecutor, buildToolDefs } from './tools';
 import type VaultAgentPlugin from './main';
@@ -47,6 +48,9 @@ export class AgentView extends ItemView {
 		setIcon(brand, 'bot-message-square');
 		brand.createSpan({ text: this.st('viewName') + ' · ' + this.plugin.currentModelLabel() });
 		const actions = header.createDiv({ cls: 'va-header-actions' });
+		const historyBtn = actions.createEl('button', { cls: 'va-icon-btn', attr: { 'aria-label': this.st('history') } });
+		setIcon(historyBtn, 'history');
+		historyBtn.addEventListener('click', () => void this.openHistory());
 		const newBtn = actions.createEl('button', { cls: 'va-icon-btn', attr: { 'aria-label': this.st('newChat') } });
 		setIcon(newBtn, 'plus');
 		newBtn.addEventListener('click', () => {
@@ -72,6 +76,8 @@ export class AgentView extends ItemView {
 		settingsBtn.addEventListener('click', () => this.plugin.openSettings());
 
 		this.msgsEl = root.createDiv({ cls: 'va-messages' });
+		this.historyEl = root.createDiv({ cls: 'va-history' });
+		this.historyEl.hide();
 		this.inputAreaEl = root.createDiv({ cls: 'va-input-area' });
 		const ta = this.inputAreaEl.createEl('textarea', { cls: 'va-input', attr: { placeholder: this.st('inputPlaceholder'), rows: '3' } });
 		this.inputEl = ta;
@@ -90,10 +96,14 @@ export class AgentView extends ItemView {
 	}
 
 	private msgsEl!: HTMLElement;
+	private historyEl!: HTMLElement;
 	private inputAreaEl!: HTMLElement;
 	private inputEl!: HTMLTextAreaElement;
 	private stopBtn!: HTMLButtonElement;
 	private sendBtn!: HTMLButtonElement;
+	/** Raw history.jsonl, cached while the history panel is open. */
+	private historyText = '';
+	private historyQuery = '';
 
 	private addWelcome(): void {
 		const el = this.msgsEl.createDiv({ cls: 'va-welcome' });
@@ -106,6 +116,80 @@ export class AgentView extends ItemView {
 			else if (m.role === 'assistant' && m.content) this.renderAssistantDone(m.content);
 		}
 		this.scrollBottom();
+	}
+
+	/** Chat and history share the view; the panel replaces the message list. */
+	private setMode(mode: 'chat' | 'history'): void {
+		const onHistory = mode === 'history';
+		this.msgsEl.toggle(!onHistory);
+		this.inputAreaEl.toggle(!onHistory);
+		this.historyEl.toggle(onHistory);
+	}
+
+	private async openHistory(): Promise<void> {
+		this.historyText = await this.plugin.readHistoryText();
+		this.historyQuery = '';
+		this.setMode('history');
+		this.renderHistory();
+	}
+
+	private renderHistory(): void {
+		this.historyEl.empty();
+		const bar = this.historyEl.createDiv({ cls: 'va-history-bar' });
+		const back = bar.createEl('button', { cls: 'va-icon-btn', attr: { 'aria-label': this.st('backToChat') } });
+		setIcon(back, 'arrow-left');
+		back.addEventListener('click', () => this.setMode('chat'));
+
+		const filter = bar.createEl('input', {
+			cls: 'va-history-filter',
+			attr: { type: 'search', placeholder: this.st('historyFilter'), 'aria-label': this.st('historyFilter') }
+		});
+		filter.value = this.historyQuery;
+		const list = this.historyEl.createDiv({ cls: 'va-history-list' });
+		filter.addEventListener('input', () => {
+			this.historyQuery = filter.value;
+			this.renderHistoryList(list);
+		});
+		filter.addEventListener('keydown', (e: KeyboardEvent) => {
+			if (e.key === 'Escape') this.setMode('chat');
+		});
+
+		this.renderHistoryList(list);
+		filter.focus();
+	}
+
+	private renderHistoryList(list: HTMLElement): void {
+		list.empty();
+		const events = parseHistory(this.historyText);
+		if (!events.length) {
+			list.createDiv({ cls: 'va-history-empty', text: this.st('historyEmpty') });
+			return;
+		}
+		const sessions = summarizeSessions(events, this.historyQuery);
+		if (!sessions.length) {
+			list.createDiv({ cls: 'va-history-empty', text: this.st('emptySearch') });
+			return;
+		}
+		for (const session of sessions) {
+			const row = list.createDiv({ cls: 'va-history-item' });
+			const meta = row.createDiv({ cls: 'va-history-meta' });
+			meta.createSpan({ cls: 'va-history-time', text: formatStamp(session.lastIso) });
+			meta.createSpan({ cls: 'va-history-count', text: `${session.events} ${this.st('historyEvents')}` });
+			row.createDiv({ cls: 'va-history-first', text: session.firstUser || this.st('historyNoUser') });
+			if (session.hit) row.createDiv({ cls: 'va-history-hit', text: session.hit });
+			row.addEventListener('click', () => this.loadSession(events, session.id));
+		}
+	}
+
+	/** Replace the chat with a past conversation; new turns keep appending to it. */
+	private loadSession(events: HistoryEvent[], sessionId: string): void {
+		this.messages = sessionTranscript(events, sessionId).map(m => ({ role: m.role, content: m.content }));
+		this.plugin.resumeSession(sessionId, sessionCursor(events, sessionId));
+		void this.plugin.saveHistory(this.messages);
+		this.renderShell();
+		if (this.messages.length) this.renderAllHistory();
+		else this.addWelcome();
+		new Notice(`${this.st('historyLoaded')}: ${sessionId.slice(0, 8)}`);
 	}
 
 	private scrollBottom(): void {
@@ -127,6 +211,12 @@ export class AgentView extends ItemView {
 			});
 			container.querySelectorAll('p, li').forEach(p => {
 				if (!p.textContent?.trim() && !p.querySelector('img,video,a,code,pre,table,svg')) p.remove();
+			});
+			// Answers often use `---` as a section break, which markdown renders as a
+			// full-width rule. A leading/trailing rule, or a run of them, reads as
+			// stray lines in a narrow bubble: drop the edges and collapse each run.
+			container.querySelectorAll('hr').forEach(hr => {
+				if (!hr.previousElementSibling || !hr.nextElementSibling || hr.previousElementSibling.tagName === 'HR') hr.remove();
 			});
 		});
 	}
@@ -372,4 +462,12 @@ export class AgentView extends ItemView {
 			void this.plugin.saveHistory(this.messages);
 		}
 	}
+}
+
+/** Local "YYYY-MM-DD HH:mm" for history rows. */
+function formatStamp(iso: string): string {
+	const date = new Date(iso);
+	if (Number.isNaN(date.getTime())) return '';
+	const pad = (n: number) => String(n).padStart(2, '0');
+	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }

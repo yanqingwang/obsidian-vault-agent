@@ -117,6 +117,11 @@ assert.equal(reasoningStreamed, 'let me think.\n\n\n\nstep 2:   ', 'reasoning de
 assert.equal(reasoning, 'let me think.\n\n\n\nstep 2:   ', 'loop returns reasoning');
 assert.equal(normalizeReasoning(reasoningStreamed), 'let me think.\n\nstep 2:', 'normalizeReasoning collapses blank-line runs');
 assert.equal(normalizeReasoning('  a \n\n\n\n\n b\n'), 'a\n\nb', 'normalizeReasoning trims edges');
+// The thinking pane is plain text, so markdown rules must not survive as dash lines.
+assert.equal(normalizeReasoning('a\n\n---\n\nb'), 'a\n\nb', 'markdown rule lines are blanked out');
+assert.equal(normalizeReasoning('a\n - - - \nb'), 'a\n\nb', 'spaced rules go too');
+assert.equal(normalizeReasoning('a\n***\nb'), 'a\n\nb', 'asterisk/underscore rules go too');
+assert.equal(normalizeReasoning('a\n- 列表项\nb'), 'a\n- 列表项\nb', 'real bullet lists survive');
 assert.equal(hitCap, false);
 assert.equal(confirmations.length, 1, 'write tool asked for confirmation');
 assert.ok(streamed.includes('我先建个笔记。'), 'streaming saw deltas');

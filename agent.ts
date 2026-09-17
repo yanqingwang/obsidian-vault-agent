@@ -266,6 +266,9 @@ export function normalizeReasoning(text: string): string {
 		.replace(/\r\n?/g, '\n')
 		.replace(/[ \t]+/g, ' ')
 		.replace(/ ?\n ?/g, '\n')
+		// The thinking pane renders plain text, so a markdown rule (`---`) shows up
+		// as a literal line of dashes. Blank it out; the run collapses just below.
+		.replace(/^([-*_]) *(?:\1 *){2,}$/gm, '')
 		.replace(/\n{3,}/g, '\n\n')
 		.trim();
 }

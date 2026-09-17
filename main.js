@@ -211,7 +211,7 @@ function truncate(s, n) {
   return s.slice(0, n) + `\u2026 [truncated, ${s.length} chars total]`;
 }
 function normalizeReasoning(text) {
-  return text.replace(/\r\n?/g, "\n").replace(/[ \t]+/g, " ").replace(/ ?\n ?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  return text.replace(/\r\n?/g, "\n").replace(/[ \t]+/g, " ").replace(/ ?\n ?/g, "\n").replace(/^([-*_]) *(?:\1 *){2,}$/gm, "").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 // proxyFetch.ts
@@ -377,6 +377,180 @@ function makeProxyFetch(proxy) {
   };
 }
 
+// history.ts
+function newSessionId() {
+  return `${Date.now().toString(36)}-${randomHex(8)}`;
+}
+function randomHex(length) {
+  const webCrypto = typeof crypto !== "undefined" ? crypto : null;
+  if (webCrypto && typeof webCrypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(Math.ceil(length / 2));
+    webCrypto.getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("").slice(0, length);
+  }
+  let out = "";
+  for (let i = 0; i < length; i++)
+    out += Math.floor(Math.random() * 16).toString(16);
+  return out;
+}
+var HistoryRecorder = class {
+  /**
+   * @param start seq/turn to continue from — pass `sessionCursor()` when
+   * resuming an existing session so numbering does not restart at 1.
+   */
+  constructor(adapter, path, sessionId, meta, start = { seq: 0, turn: 0 }) {
+    this.adapter = adapter;
+    this.path = path;
+    this.sessionId = sessionId;
+    this.meta = meta;
+    /** Tail of the append chain; keeps lines whole when events arrive rapidly. */
+    this.pending = Promise.resolve();
+    this.seq = start.seq;
+    this.turn = start.turn;
+  }
+  user(text) {
+    this.turn++;
+    this.write({ type: "user", role: "user", content: text });
+  }
+  assistant(text, reasoning) {
+    this.write({ type: "assistant", role: "assistant", content: text, reasoning: reasoning || void 0 });
+  }
+  toolCall(call) {
+    this.write({
+      type: "tool_call",
+      role: "tool",
+      tool: call.function.name,
+      callId: call.id,
+      args: call.function.arguments
+    });
+  }
+  toolResult(call, result, durationMs) {
+    this.write({
+      type: "tool_result",
+      role: "tool",
+      tool: call.function.name,
+      callId: call.id,
+      ok: result.ok,
+      content: result.content,
+      durationMs: Math.max(0, Math.round(durationMs))
+    });
+  }
+  error(message) {
+    this.write({ type: "error", role: "assistant", content: message });
+  }
+  /** Resolves once every queued line has been handed to the adapter. */
+  flush() {
+    return this.pending;
+  }
+  /**
+   * Appends are chained rather than fired in parallel: two overlapping
+   * `append` calls could otherwise interleave and corrupt a JSONL line.
+   * Logging must never break the chat, so failures are swallowed.
+   */
+  write(partial) {
+    this.seq++;
+    const event = {
+      ...this.meta(),
+      id: randomHex(16),
+      ts: Date.now(),
+      iso: (/* @__PURE__ */ new Date()).toISOString(),
+      session: this.sessionId,
+      seq: this.seq,
+      turn: this.turn,
+      ...partial
+    };
+    const line = JSON.stringify(event) + "\n";
+    this.pending = this.pending.then(() => this.adapter.append(this.path, line)).catch(() => void 0);
+  }
+};
+function parseHistory(text) {
+  const events = [];
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed)
+      continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      const event = parsed;
+      if (event && typeof event === "object" && typeof event.session === "string") {
+        events.push(event);
+      }
+    } catch {
+    }
+  }
+  return events;
+}
+function summarizeSessions(events, query = "") {
+  const needle = query.trim().toLowerCase();
+  const bySession = /* @__PURE__ */ new Map();
+  for (const event of events) {
+    const bucket = bySession.get(event.session);
+    if (bucket)
+      bucket.push(event);
+    else
+      bySession.set(event.session, [event]);
+  }
+  const out = [];
+  for (const [id, bucket] of bySession) {
+    const ordered = [...bucket].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+    let hit;
+    if (needle) {
+      const match = ordered.find((e) => eventText(e).toLowerCase().includes(needle));
+      if (!match)
+        continue;
+      hit = excerpt(eventText(match), needle);
+    }
+    out.push({
+      id,
+      events: ordered.length,
+      lastMs: ordered.reduce((max, e) => Math.max(max, e.ts ?? 0), 0),
+      lastIso: ordered[ordered.length - 1]?.iso ?? "",
+      firstUser: firstUserText(ordered),
+      hit
+    });
+  }
+  return out.sort((a, b) => b.lastMs - a.lastMs);
+}
+function sessionTranscript(events, sessionId) {
+  const out = [];
+  const ordered = events.filter((e) => e.session === sessionId).sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+  for (const event of ordered) {
+    if ((event.type === "user" || event.type === "assistant") && event.content) {
+      out.push({ role: event.type === "user" ? "user" : "assistant", content: event.content });
+    }
+  }
+  return out;
+}
+function sessionCursor(events, sessionId) {
+  const cursor = { seq: 0, turn: 0 };
+  for (const event of events) {
+    if (event.session !== sessionId)
+      continue;
+    cursor.seq = Math.max(cursor.seq, event.seq ?? 0);
+    cursor.turn = Math.max(cursor.turn, event.turn ?? 0);
+  }
+  return cursor;
+}
+function excerpt(text, needle, width = 90) {
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (!flat)
+    return "";
+  const at = flat.toLowerCase().indexOf(needle.toLowerCase());
+  if (at < 0)
+    return flat.slice(0, width) + (flat.length > width ? "\u2026" : "");
+  const half = Math.floor(width / 2);
+  const start = Math.max(0, at - half);
+  const end = Math.min(flat.length, at + needle.length + half);
+  return (start ? "\u2026" : "") + flat.slice(start, end) + (end < flat.length ? "\u2026" : "");
+}
+function eventText(event) {
+  return [event.content, event.reasoning, event.args, event.tool].filter((value) => typeof value === "string" && value.length > 0).join("\n");
+}
+function firstUserText(ordered) {
+  const first = ordered.find((e) => e.type === "user");
+  return (first?.content ?? "").replace(/\s+/g, " ").trim();
+}
+
 // i18n.ts
 var zh = {
   viewName: "Vault Agent",
@@ -423,7 +597,14 @@ var zh = {
   denied: "\u7528\u6237\u62D2\u7EDD\u4E86\u8BE5\u64CD\u4F5C\u3002",
   openSettings: "\u6253\u5F00\u8BBE\u7F6E",
   clearChat: "\u6E05\u7A7A\u5F53\u524D\u5BF9\u8BDD",
-  emptySearch: "\u6CA1\u6709\u5339\u914D\u7ED3\u679C"
+  emptySearch: "\u6CA1\u6709\u5339\u914D\u7ED3\u679C",
+  history: "\u5386\u53F2\u8BB0\u5F55",
+  historyFilter: "\u641C\u7D22\u5386\u53F2\u5BF9\u8BDD\u2026",
+  historyEmpty: "\u8FD8\u6CA1\u6709\u5386\u53F2\u8BB0\u5F55\uFF0C\u53D1\u4E00\u6761\u6D88\u606F\u540E\u5C31\u4F1A\u51FA\u73B0\u5728\u8FD9\u91CC\u3002",
+  historyNoUser: "\uFF08\u65E0\u7528\u6237\u6D88\u606F\uFF09",
+  historyEvents: "\u6761\u4E8B\u4EF6",
+  backToChat: "\u8FD4\u56DE\u5BF9\u8BDD",
+  historyLoaded: "\u5DF2\u8F7D\u5165\u4F1A\u8BDD"
 };
 var en = {
   viewName: "Vault Agent",
@@ -470,7 +651,14 @@ var en = {
   denied: "User denied this action.",
   openSettings: "Open settings",
   clearChat: "Clear conversation",
-  emptySearch: "No matches"
+  emptySearch: "No matches",
+  history: "History",
+  historyFilter: "Search history\u2026",
+  historyEmpty: "No history yet \u2014 send a message and it will show up here.",
+  historyNoUser: "(no user message)",
+  historyEvents: "events",
+  backToChat: "Back to chat",
+  historyLoaded: "Loaded session"
 };
 var STRINGS = { zh, en };
 function t(lang, key) {
@@ -780,6 +968,9 @@ var AgentView = class extends import_obsidian2.ItemView {
     this.messages = [];
     this.running = false;
     this.abort = null;
+    /** Raw history.jsonl, cached while the history panel is open. */
+    this.historyText = "";
+    this.historyQuery = "";
   }
   getViewType() {
     return VIEW_TYPE_AGENT;
@@ -817,6 +1008,9 @@ var AgentView = class extends import_obsidian2.ItemView {
     (0, import_obsidian2.setIcon)(brand, "bot-message-square");
     brand.createSpan({ text: this.st("viewName") + " \xB7 " + this.plugin.currentModelLabel() });
     const actions = header.createDiv({ cls: "va-header-actions" });
+    const historyBtn = actions.createEl("button", { cls: "va-icon-btn", attr: { "aria-label": this.st("history") } });
+    (0, import_obsidian2.setIcon)(historyBtn, "history");
+    historyBtn.addEventListener("click", () => void this.openHistory());
     const newBtn = actions.createEl("button", { cls: "va-icon-btn", attr: { "aria-label": this.st("newChat") } });
     (0, import_obsidian2.setIcon)(newBtn, "plus");
     newBtn.addEventListener("click", () => {
@@ -843,6 +1037,8 @@ var AgentView = class extends import_obsidian2.ItemView {
     (0, import_obsidian2.setIcon)(settingsBtn, "settings");
     settingsBtn.addEventListener("click", () => this.plugin.openSettings());
     this.msgsEl = root.createDiv({ cls: "va-messages" });
+    this.historyEl = root.createDiv({ cls: "va-history" });
+    this.historyEl.hide();
     this.inputAreaEl = root.createDiv({ cls: "va-input-area" });
     const ta = this.inputAreaEl.createEl("textarea", { cls: "va-input", attr: { placeholder: this.st("inputPlaceholder"), rows: "3" } });
     this.inputEl = ta;
@@ -872,6 +1068,77 @@ var AgentView = class extends import_obsidian2.ItemView {
     }
     this.scrollBottom();
   }
+  /** Chat and history share the view; the panel replaces the message list. */
+  setMode(mode) {
+    const onHistory = mode === "history";
+    this.msgsEl.toggle(!onHistory);
+    this.inputAreaEl.toggle(!onHistory);
+    this.historyEl.toggle(onHistory);
+  }
+  async openHistory() {
+    this.historyText = await this.plugin.readHistoryText();
+    this.historyQuery = "";
+    this.setMode("history");
+    this.renderHistory();
+  }
+  renderHistory() {
+    this.historyEl.empty();
+    const bar = this.historyEl.createDiv({ cls: "va-history-bar" });
+    const back = bar.createEl("button", { cls: "va-icon-btn", attr: { "aria-label": this.st("backToChat") } });
+    (0, import_obsidian2.setIcon)(back, "arrow-left");
+    back.addEventListener("click", () => this.setMode("chat"));
+    const filter = bar.createEl("input", {
+      cls: "va-history-filter",
+      attr: { type: "search", placeholder: this.st("historyFilter"), "aria-label": this.st("historyFilter") }
+    });
+    filter.value = this.historyQuery;
+    const list = this.historyEl.createDiv({ cls: "va-history-list" });
+    filter.addEventListener("input", () => {
+      this.historyQuery = filter.value;
+      this.renderHistoryList(list);
+    });
+    filter.addEventListener("keydown", (e) => {
+      if (e.key === "Escape")
+        this.setMode("chat");
+    });
+    this.renderHistoryList(list);
+    filter.focus();
+  }
+  renderHistoryList(list) {
+    list.empty();
+    const events = parseHistory(this.historyText);
+    if (!events.length) {
+      list.createDiv({ cls: "va-history-empty", text: this.st("historyEmpty") });
+      return;
+    }
+    const sessions = summarizeSessions(events, this.historyQuery);
+    if (!sessions.length) {
+      list.createDiv({ cls: "va-history-empty", text: this.st("emptySearch") });
+      return;
+    }
+    for (const session of sessions) {
+      const row = list.createDiv({ cls: "va-history-item" });
+      const meta = row.createDiv({ cls: "va-history-meta" });
+      meta.createSpan({ cls: "va-history-time", text: formatStamp(session.lastIso) });
+      meta.createSpan({ cls: "va-history-count", text: `${session.events} ${this.st("historyEvents")}` });
+      row.createDiv({ cls: "va-history-first", text: session.firstUser || this.st("historyNoUser") });
+      if (session.hit)
+        row.createDiv({ cls: "va-history-hit", text: session.hit });
+      row.addEventListener("click", () => this.loadSession(events, session.id));
+    }
+  }
+  /** Replace the chat with a past conversation; new turns keep appending to it. */
+  loadSession(events, sessionId) {
+    this.messages = sessionTranscript(events, sessionId).map((m) => ({ role: m.role, content: m.content }));
+    this.plugin.resumeSession(sessionId, sessionCursor(events, sessionId));
+    void this.plugin.saveHistory(this.messages);
+    this.renderShell();
+    if (this.messages.length)
+      this.renderAllHistory();
+    else
+      this.addWelcome();
+    new import_obsidian2.Notice(`${this.st("historyLoaded")}: ${sessionId.slice(0, 8)}`);
+  }
   scrollBottom() {
     this.msgsEl.scrollTop = this.msgsEl.scrollHeight;
   }
@@ -892,6 +1159,10 @@ var AgentView = class extends import_obsidian2.ItemView {
       container.querySelectorAll("p, li").forEach((p) => {
         if (!p.textContent?.trim() && !p.querySelector("img,video,a,code,pre,table,svg"))
           p.remove();
+      });
+      container.querySelectorAll("hr").forEach((hr) => {
+        if (!hr.previousElementSibling || !hr.nextElementSibling || hr.previousElementSibling.tagName === "HR")
+          hr.remove();
       });
     });
   }
@@ -1128,89 +1399,13 @@ var AgentView = class extends import_obsidian2.ItemView {
     }
   }
 };
-
-// history.ts
-function newSessionId() {
-  return `${Date.now().toString(36)}-${randomHex(8)}`;
+function formatStamp(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime()))
+    return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
-function randomHex(length) {
-  const webCrypto = typeof crypto !== "undefined" ? crypto : null;
-  if (webCrypto && typeof webCrypto.getRandomValues === "function") {
-    const bytes = new Uint8Array(Math.ceil(length / 2));
-    webCrypto.getRandomValues(bytes);
-    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("").slice(0, length);
-  }
-  let out = "";
-  for (let i = 0; i < length; i++)
-    out += Math.floor(Math.random() * 16).toString(16);
-  return out;
-}
-var HistoryRecorder = class {
-  constructor(adapter, path, sessionId, meta) {
-    this.adapter = adapter;
-    this.path = path;
-    this.sessionId = sessionId;
-    this.meta = meta;
-    this.seq = 0;
-    this.turn = 0;
-    /** Tail of the append chain; keeps lines whole when events arrive rapidly. */
-    this.pending = Promise.resolve();
-  }
-  user(text) {
-    this.turn++;
-    this.write({ type: "user", role: "user", content: text });
-  }
-  assistant(text, reasoning) {
-    this.write({ type: "assistant", role: "assistant", content: text, reasoning: reasoning || void 0 });
-  }
-  toolCall(call) {
-    this.write({
-      type: "tool_call",
-      role: "tool",
-      tool: call.function.name,
-      callId: call.id,
-      args: call.function.arguments
-    });
-  }
-  toolResult(call, result, durationMs) {
-    this.write({
-      type: "tool_result",
-      role: "tool",
-      tool: call.function.name,
-      callId: call.id,
-      ok: result.ok,
-      content: result.content,
-      durationMs: Math.max(0, Math.round(durationMs))
-    });
-  }
-  error(message) {
-    this.write({ type: "error", role: "assistant", content: message });
-  }
-  /** Resolves once every queued line has been handed to the adapter. */
-  flush() {
-    return this.pending;
-  }
-  /**
-   * Appends are chained rather than fired in parallel: two overlapping
-   * `append` calls could otherwise interleave and corrupt a JSONL line.
-   * Logging must never break the chat, so failures are swallowed.
-   */
-  write(partial) {
-    this.seq++;
-    const event = {
-      ...this.meta(),
-      id: randomHex(16),
-      ts: Date.now(),
-      iso: (/* @__PURE__ */ new Date()).toISOString(),
-      session: this.sessionId,
-      seq: this.seq,
-      turn: this.turn,
-      ...partial
-    };
-    const line = JSON.stringify(event) + "\n";
-    this.pending = this.pending.then(() => this.adapter.append(this.path, line)).catch(() => void 0);
-  }
-};
 
 // main.ts
 var PROVIDERS = [
@@ -1307,17 +1502,7 @@ var VaultAgentPlugin = class extends import_obsidian3.Plugin {
    */
   get history() {
     if (!this.recorder) {
-      const session = this.settings.sessionId || this.startSession();
-      this.recorder = new HistoryRecorder(
-        this.app.vault.adapter,
-        this.historyPath(),
-        session,
-        () => ({
-          vault: this.app.vault.getName(),
-          provider: this.settings.providerId,
-          model: this.settings.model
-        })
-      );
+      this.recorder = this.newRecorder(this.settings.sessionId || this.startSession());
     }
     return this.recorder;
   }
@@ -1328,6 +1513,33 @@ var VaultAgentPlugin = class extends import_obsidian3.Plugin {
     this.recorder = null;
     void this.saveSettings();
     return id;
+  }
+  /**
+   * Continue an existing session picked in the history panel: new events append
+   * to it, with seq/turn picking up where its transcript left off.
+   */
+  resumeSession(sessionId, cursor) {
+    this.settings.sessionId = sessionId;
+    this.recorder = this.newRecorder(sessionId, cursor);
+    void this.saveSettings();
+  }
+  /** Raw `history.jsonl` text; empty string when nothing has been recorded yet. */
+  async readHistoryText() {
+    try {
+      return await this.app.vault.adapter.read(this.historyPath());
+    } catch {
+      return "";
+    }
+  }
+  newRecorder(session, cursor = { seq: 0, turn: 0 }) {
+    return new HistoryRecorder(this.app.vault.adapter, this.historyPath(), session, () => this.historyMeta(), cursor);
+  }
+  historyMeta() {
+    return {
+      vault: this.app.vault.getName(),
+      provider: this.settings.providerId,
+      model: this.settings.model
+    };
   }
 };
 var VASettingTab = class extends import_obsidian3.PluginSettingTab {

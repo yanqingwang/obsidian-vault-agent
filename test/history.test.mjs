@@ -18,7 +18,8 @@ await build({
 	format: 'esm',
 	platform: 'node'
 });
-const { HistoryRecorder, newSessionId } = await import(pathToFileURL(out).href);
+const { HistoryRecorder, newSessionId, parseHistory, summarizeSessions, sessionTranscript, sessionCursor, excerpt } =
+	await import(pathToFileURL(out).href);
 
 /** Collects appended chunks; a small delay makes interleaving detectable. */
 function fakeAdapter() {
@@ -131,7 +132,66 @@ const call = { id: 'call_1', type: 'function', function: { name: 'read_note', ar
 	await rec.flush();
 }
 
-// --- 4. session ids ----------------------------------------------------------
+// --- 5. parse + summarize for the sidebar panel ------------------------------
+const transcript = [
+	{ id: 'a1', ts: 1000, iso: '2026-09-17T01:00:00.000Z', session: 's-old', seq: 1, turn: 1, type: 'user', role: 'user', content: '帮我整理 nextcloud 同步的笔记' },
+	{ id: 'a2', ts: 1100, iso: '2026-09-17T01:00:00.100Z', session: 's-old', seq: 2, turn: 1, type: 'assistant', role: 'assistant', content: '找到 1 条：Notes/sync.md' },
+	{ id: 'b1', ts: 5000, iso: '2026-09-17T01:01:00.000Z', session: 's-new', seq: 1, turn: 1, type: 'user', role: 'user', content: '把当前笔记结尾改成总结' },
+	{ id: 'b2', ts: 5200, iso: '2026-09-17T01:01:00.200Z', session: 's-new', seq: 2, turn: 1, type: 'tool_call', role: 'tool', tool: 'edit_note', args: '{"path":"Draft/plan.md"}' },
+	{ id: 'b3', ts: 5400, iso: '2026-09-17T01:01:00.400Z', session: 's-new', seq: 3, turn: 1, type: 'tool_result', role: 'tool', tool: 'edit_note', ok: true, content: 'edited Draft/plan.md' },
+	{ id: 'b4', ts: 5600, iso: '2026-09-17T01:01:00.600Z', session: 's-new', seq: 4, turn: 1, type: 'assistant', role: 'assistant', content: '已改好。' }
+];
+
+// Torn last line (interrupted append) and a blank line must not break parsing.
+const raw = transcript.map(e => JSON.stringify(e)).join('\n') + '\n\n{"id":"torn","session":"s-new","seq"\n';
+const parsed = parseHistory(raw);
+assert.equal(parsed.length, 6, 'torn trailing line is skipped, blank lines ignored');
+assert.deepEqual(parseHistory('').length, 0);
+assert.deepEqual(parseHistory('not json\n').length, 0);
+
+const sessions = summarizeSessions(parsed);
+assert.deepEqual(sessions.map(s => s.id), ['s-new', 's-old'], 'newest first');
+assert.equal(sessions[0].events, 4);
+assert.equal(sessions[0].firstUser, '把当前笔记结尾改成总结');
+assert.equal(sessions[0].lastMs, 5600);
+assert.equal(sessions[0].hit, undefined, 'no query means no hit snippet');
+
+const filtered = summarizeSessions(parsed, 'NEXTCLOUD');
+assert.deepEqual(filtered.map(s => s.id), ['s-old'], 'query is case-insensitive');
+assert.ok(filtered[0].hit.includes('nextcloud'), 'hit snippet carries the match');
+
+// Tool args are searchable too, so "which notes did it edit" is answerable.
+assert.deepEqual(summarizeSessions(parsed, 'Draft/plan.md').map(s => s.id), ['s-new']);
+assert.deepEqual(summarizeSessions(parsed, 'read_note').length, 0);
+
+assert.deepEqual(sessionTranscript(parsed, 's-new'), [
+	{ role: 'user', content: '把当前笔记结尾改成总结' },
+	{ role: 'assistant', content: '已改好。' }
+], 'transcript keeps text turns only, in seq order');
+assert.deepEqual(sessionTranscript(parsed, 'nope'), []);
+
+assert.deepEqual(sessionCursor(parsed, 's-new'), { seq: 4, turn: 1 });
+assert.deepEqual(sessionCursor(parsed, 'nope'), { seq: 0, turn: 0 });
+
+assert.equal(excerpt('前面很长的一段说明后面才是关键词后面还有结尾', '关键词', 10).includes('关键词'), true);
+assert.equal(excerpt('', 'x'), '');
+
+// --- 6. a resumed session continues numbering --------------------------------
+{
+	const adapter = fakeAdapter();
+	const cursor = sessionCursor(parsed, 's-new');
+	const rec = new HistoryRecorder(adapter, 'history.jsonl', 's-new', () => ({}), cursor);
+	rec.user('接着聊');
+	rec.assistant('好', '');
+	await rec.flush();
+	const [user, assistant] = adapter.chunks.map(c => JSON.parse(c));
+	assert.equal(user.seq, 5, 'seq continues after the last stored event');
+	assert.equal(user.turn, 2, 'turn continues too');
+	assert.equal(assistant.seq, 6);
+	assert.equal(assistant.session, 's-new', 'events land in the resumed session');
+}
+
+// --- 7. session ids ----------------------------------------------------------
 {
 	const ids = new Set(Array.from({ length: 50 }, () => newSessionId()));
 	assert.equal(ids.size, 50);

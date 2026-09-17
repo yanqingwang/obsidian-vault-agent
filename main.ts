@@ -1,6 +1,6 @@
 import { App, Plugin, PluginSettingTab, Setting, normalizePath, requestUrl, WorkspaceLeaf, type SettingDefinitionItem } from 'obsidian';
 import { AgentView, VIEW_TYPE_AGENT } from './view';
-import { HistoryRecorder, newSessionId, type HistoryMeta } from './history';
+import { HistoryRecorder, newSessionId, type HistoryMeta, type SessionCursor } from './history';
 import { t, Lang } from './i18n';
 
 export interface ProviderPreset {
@@ -138,17 +138,7 @@ export default class VaultAgentPlugin extends Plugin {
 	 */
 	get history(): HistoryRecorder {
 		if (!this.recorder) {
-			const session = this.settings.sessionId || this.startSession();
-			this.recorder = new HistoryRecorder(
-				this.app.vault.adapter,
-				this.historyPath(),
-				session,
-				(): HistoryMeta => ({
-					vault: this.app.vault.getName(),
-					provider: this.settings.providerId,
-					model: this.settings.model
-				})
-			);
+			this.recorder = this.newRecorder(this.settings.sessionId || this.startSession());
 		}
 		return this.recorder;
 	}
@@ -160,6 +150,37 @@ export default class VaultAgentPlugin extends Plugin {
 		this.recorder = null;
 		void this.saveSettings();
 		return id;
+	}
+
+	/**
+	 * Continue an existing session picked in the history panel: new events append
+	 * to it, with seq/turn picking up where its transcript left off.
+	 */
+	resumeSession(sessionId: string, cursor: SessionCursor): void {
+		this.settings.sessionId = sessionId;
+		this.recorder = this.newRecorder(sessionId, cursor);
+		void this.saveSettings();
+	}
+
+	/** Raw `history.jsonl` text; empty string when nothing has been recorded yet. */
+	async readHistoryText(): Promise<string> {
+		try {
+			return await this.app.vault.adapter.read(this.historyPath());
+		} catch {
+			return '';
+		}
+	}
+
+	private newRecorder(session: string, cursor: SessionCursor = { seq: 0, turn: 0 }): HistoryRecorder {
+		return new HistoryRecorder(this.app.vault.adapter, this.historyPath(), session, () => this.historyMeta(), cursor);
+	}
+
+	private historyMeta(): HistoryMeta {
+		return {
+			vault: this.app.vault.getName(),
+			provider: this.settings.providerId,
+			model: this.settings.model
+		};
 	}
 }
 

@@ -98,6 +98,13 @@
 .va-assistant > *:last-child, .va-welcome > *:last-child { margin-bottom: 0; }
 .va-assistant ul, .va-assistant ol, .va-welcome ul, .va-welcome ol { margin: 0.35em 0; padding-inline-start: 1.4em; }
 .va-assistant pre, .va-assistant blockquote, .va-welcome pre { margin: 0.4em 0; }
+/* Section breaks written as `---`: the theme rule is thick with 2em margins,
+   which reads as a big gap plus a line inside a chat bubble. */
+.va-assistant hr, .va-welcome hr {
+  margin: 0.6em 0;
+  border: none;
+  border-top: 1px solid var(--background-modifier-border);
+}
 .va-welcome {
   border: 1px dashed var(--background-modifier-border);
   border-radius: 10px;
@@ -180,6 +187,77 @@
   opacity: 0.45;
   cursor: not-allowed;
   box-shadow: none;
+}
+
+/* History panel */
+.va-history {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.va-history-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  flex: 0 0 auto;
+}
+.va-history-filter {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--font-ui-small);
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-normal);
+}
+.va-history-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.va-history-item {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: var(--font-ui-small);
+}
+.va-history-item:hover { background: var(--background-modifier-hover); }
+.va-history-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+.va-history-first {
+  color: var(--text-normal);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.va-history-hit {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.va-history-empty {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  padding: 16px 10px;
+  text-align: center;
 }
 
 /* Settings */
