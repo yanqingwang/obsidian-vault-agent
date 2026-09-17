@@ -214,6 +214,169 @@ function normalizeReasoning(text) {
   return text.replace(/\r\n?/g, "\n").replace(/[ \t]+/g, " ").replace(/ ?\n ?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+// proxyFetch.ts
+function parseProxy(proxy) {
+  let raw = proxy.trim();
+  if (/^socks/i.test(raw)) {
+    throw new Error("SOCKS proxies are not supported \u2014 use an HTTP proxy, e.g. http://127.0.0.1:9000");
+  }
+  raw = raw.replace(/^https?:\/\//i, "");
+  const m = /^(?:([^@/:]+):([^@/]*)@)?([a-zA-Z0-9.\-_]+):(\d+)$/.exec(raw);
+  if (!m) {
+    throw new Error(`invalid proxy address: ${proxy} (expected host:port, e.g. 127.0.0.1:9000)`);
+  }
+  const conf = { host: m[3], port: Number(m[4]) };
+  if (m[1] !== void 0) {
+    conf.auth = "Basic " + btoa(`${m[1]}:${m[2] ?? ""}`);
+  }
+  return conf;
+}
+function toError(e) {
+  return e instanceof Error ? e : new Error(String(e));
+}
+function nodeRequire(mod) {
+  const w = typeof window !== "undefined" ? window : void 0;
+  const req = w?.require;
+  if (!req) {
+    throw new Error("Node modules are unavailable here \u2014 the local proxy feature requires Obsidian desktop.");
+  }
+  return req(mod);
+}
+function proxyHeaders(conf, extra) {
+  return { ...extra, ...conf.auth ? { "Proxy-Authorization": conf.auth } : {} };
+}
+function forwardRequest(conf, url, init) {
+  return new Promise((resolve, reject) => {
+    const http = nodeRequire("http");
+    const u = new URL(url);
+    const req = http.request({
+      host: conf.host,
+      port: conf.port,
+      method: init.method,
+      path: url,
+      headers: proxyHeaders(conf, { ...init.headers, Host: u.host })
+    }, (res) => resolve(res));
+    req.on("error", (err) => reject(toError(err)));
+    if (init.signal) {
+      init.signal.addEventListener("abort", () => req.destroy(new Error("aborted")), { once: true });
+    }
+    if (init.body)
+      req.write(init.body);
+    req.end();
+  });
+}
+function connectAndRequest(conf, url, init) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const port = Number(u.port) || 443;
+    const http = nodeRequire("http");
+    const https = nodeRequire("https");
+    const conn = http.request({
+      host: conf.host,
+      port: conf.port,
+      method: "CONNECT",
+      path: `${u.hostname}:${port}`,
+      headers: proxyHeaders(conf, { Host: `${u.hostname}:${port}` })
+    });
+    conn.on("error", (err) => reject(toError(err)));
+    if (init.signal) {
+      init.signal.addEventListener("abort", () => conn.destroy(new Error("aborted")), { once: true });
+    }
+    conn.on("connect", (...args) => {
+      const res = args[0];
+      const socket = args[1];
+      if (res.statusCode !== 200) {
+        res.destroy();
+        reject(new Error(`proxy CONNECT failed with status ${res.statusCode}`));
+        return;
+      }
+      const tlsReq = https.request({
+        hostname: u.hostname,
+        port,
+        path: u.pathname + u.search,
+        method: init.method,
+        headers: init.headers,
+        servername: u.hostname,
+        createConnection: () => socket
+      }, (res2) => resolve(res2));
+      tlsReq.on("error", (err) => reject(toError(err)));
+      if (init.signal) {
+        init.signal.addEventListener("abort", () => tlsReq.destroy(new Error("aborted")), { once: true });
+      }
+      if (init.body)
+        tlsReq.write(init.body);
+      tlsReq.end();
+    });
+    conn.end();
+  });
+}
+function toStream(nodeRes) {
+  return new ReadableStream({
+    start(controller) {
+      nodeRes.on("data", (...args) => {
+        try {
+          controller.enqueue(args[0]);
+        } catch {
+        }
+      });
+      nodeRes.on("end", () => {
+        try {
+          controller.close();
+        } catch {
+        }
+      });
+      nodeRes.on("error", (...args) => {
+        try {
+          controller.error(args[0] instanceof Error ? args[0] : new Error("stream error"));
+        } catch {
+        }
+      });
+    },
+    cancel() {
+      nodeRes.destroy();
+    }
+  });
+}
+function makeProxyFetch(proxy) {
+  const conf = parseProxy(proxy);
+  return async (url, init) => {
+    const nodeRes = new URL(url).protocol === "https:" ? await connectAndRequest(conf, url, init) : await forwardRequest(conf, url, init);
+    const status = nodeRes.statusCode ?? 0;
+    let bodyUsed = false;
+    let bodyStream = null;
+    const result = {
+      ok: status >= 200 && status < 300,
+      status,
+      text: () => {
+        if (bodyUsed)
+          throw new Error("response body already consumed");
+        bodyUsed = true;
+        return new Promise((resolve, reject) => {
+          let out = "";
+          nodeRes.setEncoding("utf8");
+          nodeRes.on("data", (...args) => {
+            out += String(args[0]);
+          });
+          nodeRes.on("end", () => resolve(out));
+          nodeRes.on("error", (...args) => reject(args[0] instanceof Error ? args[0] : new Error("stream error")));
+        });
+      },
+      body: null
+    };
+    Object.defineProperty(result, "body", {
+      get: () => {
+        if (bodyUsed)
+          return null;
+        bodyUsed = true;
+        if (!bodyStream)
+          bodyStream = toStream(nodeRes);
+        return bodyStream;
+      }
+    });
+    return result;
+  };
+}
+
 // i18n.ts
 var zh = {
   viewName: "Vault Agent",
@@ -238,6 +401,8 @@ var zh = {
   baseUrl: "API \u5730\u5740 (Base URL)",
   apiKey: "API Key",
   apiKeyDesc: "\u4EC5\u4FDD\u5B58\u5728\u672C\u673A Obsidian \u914D\u7F6E\u5185\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u3002",
+  proxy: "\u672C\u5730\u4EE3\u7406\uFF08\u53EF\u9009\uFF09",
+  proxyDesc: "\u586B HTTP \u4EE3\u7406\u5730\u5740\uFF08\u5982 http://127.0.0.1:9000\uFF09\uFF0CAI \u8BF7\u6C42\u7ECF\u5B83\u8F6C\u53D1\uFF1B\u7559\u7A7A\u76F4\u8FDE\u3002\u4EC5\u684C\u9762\u7AEF\u751F\u6548\u3002",
   model: "\u6A21\u578B ID",
   modelDesc: "\u4EE5\u670D\u52A1\u5546\u63A7\u5236\u53F0\u4E3A\u51C6\uFF0C\u53EF\u81EA\u7531\u586B\u5199\u3002",
   modelPreset: "\u5E38\u7528\u6A21\u578B\uFF08\u70B9\u9009\u586B\u5165\uFF09",
@@ -283,6 +448,8 @@ var en = {
   baseUrl: "API base URL",
   apiKey: "API key",
   apiKeyDesc: "Stored locally in Obsidian config only; never uploaded.",
+  proxy: "Local proxy (optional)",
+  proxyDesc: "HTTP proxy for AI requests (e.g. http://127.0.0.1:9000). Leave empty for direct connection. Desktop only.",
   model: "Model ID",
   modelDesc: "Use the model ID from your provider console.",
   modelPreset: "Common models (click to fill)",
@@ -907,7 +1074,8 @@ var AgentView = class extends import_obsidian2.ItemView {
     const chipQueue = [];
     const toolStartedAt = /* @__PURE__ */ new Map();
     try {
-      const fetchImpl = (url, init) => window.fetch(url, init);
+      const proxy = s.proxyUrl.trim();
+      const fetchImpl = proxy ? makeProxyFetch(proxy) : (url, init) => window.fetch(url, init);
       const { text, reasoning, hitCap } = await runAgentLoop({
         baseUrl: s.baseUrl,
         apiKey: s.apiKey,
@@ -921,7 +1089,10 @@ var AgentView = class extends import_obsidian2.ItemView {
         signal: this.abort.signal,
         confirmWrite: (summary) => this.confirmWrite(summary),
         fetchImpl,
-        fallbackPost: (url, headers, body) => this.plugin.fallbackPost(url, headers, body),
+        fallbackPost: proxy ? async (url, headers, body) => {
+          const r = await fetchImpl(url, { method: "POST", headers, body });
+          return { status: r.status, body: await r.text() };
+        } : (url, headers, body) => this.plugin.fallbackPost(url, headers, body),
         onText: (d) => stream.push(d),
         onReasoning: (d) => stream.pushReasoning(d),
         onToolStart: (call) => {
@@ -1058,6 +1229,7 @@ var DEFAULT_SETTINGS = {
   providerId: "deepseek",
   baseUrl: "https://api.deepseek.com/v1",
   apiKey: "",
+  proxyUrl: "",
   model: "deepseek-chat",
   temperature: 0.7,
   maxTokens: 8192,
@@ -1194,6 +1366,11 @@ var VASettingTab = class extends import_obsidian3.PluginSettingTab {
         control: { type: "text", key: "apiKey", placeholder: "sk-\u2026" }
       },
       {
+        name: this.st("proxy"),
+        desc: this.st("proxyDesc"),
+        control: { type: "text", key: "proxyUrl", placeholder: "http://127.0.0.1:9000" }
+      },
+      {
         name: this.st("model"),
         desc: this.st("modelDesc"),
         control: { type: "text", key: "model" }
@@ -1309,6 +1486,10 @@ var VASettingTab = class extends import_obsidian3.PluginSettingTab {
         await this.plugin.saveSettings();
       });
     });
+    new import_obsidian3.Setting(containerEl).setName(this.st("proxy")).setDesc(this.st("proxyDesc")).addText((tx) => tx.setValue(s.proxyUrl).onChange(async (v) => {
+      s.proxyUrl = v.trim();
+      await this.plugin.saveSettings();
+    }));
     const modelSetting = new import_obsidian3.Setting(containerEl).setName(this.st("model")).setDesc(this.st("modelDesc"));
     modelSetting.addText((tx) => tx.setValue(s.model).onChange(async (v) => {
       s.model = v.trim();

@@ -27,6 +27,7 @@ A China-first Obsidian agent plugin that talks directly to OpenAI-compatible LLM
 
 - **智能体工具调用**：`search_notes` / `read_note` / `list_notes` / `get_active_note` / `create_note` / `edit_note`（精确替换）/ `append_note` / `read_properties`，单轮可多步连续操作。
 - **流式输出**：SSE 流式渲染，支持 reasoning（DeepSeek-R1 / Kimi thinking 等）；直连失败自动降级为非流式（Obsidian requestUrl）。
+- **本地代理（可选）**：AI 请求可经本机 HTTP 代理转发（`http://` 绝对 URI 直转、`https://` CONNECT 隧道），仅桌面端。
 - **写操作确认**：默认每次创建/修改前询问；可在设置中开启自动执行。
 - **上下文感知**：自动告知当前打开的笔记路径，方便直接整理正在编辑的内容。
 - **中文优先**：内置中文系统提示与界面，可切换英文；自定义系统提示词。
@@ -37,6 +38,11 @@ A China-first Obsidian agent plugin that talks directly to OpenAI-compatible LLM
 1. 设置 → Vault Agent → 选择服务商 → 粘贴 API Key → 选择模型。
 2. 点击左侧 ribbon 图标（或命令面板 "Open Vault Agent"）打开侧栏对话。
 3. 例如：「找出最近关于 X 的笔记整理成一篇 MOC」「把当前笔记的结尾改成总结段落」。
+
+## 本地代理 / Local proxy
+
+设置 → Vault Agent → **本地代理（可选）** 填 `host:port`（如 `http://127.0.0.1:9000`；需认证时写 `user:pass@host:port`），
+AI 请求即经该代理转发，便于抓包排查或在受限网络下中转；留空直连。仅桌面端生效，不支持 SOCKS。
 
 ## 会话历史 / Conversation history
 

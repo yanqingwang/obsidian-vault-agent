@@ -3,6 +3,8 @@
  * Framework-free so it can be unit-tested in Node with a mock server.
  */
 
+import type { FetchLike } from './proxyFetch';
+
 export interface ChatMessage {
 	role: 'system' | 'user' | 'assistant' | 'tool';
 	content: string | null;
@@ -37,8 +39,8 @@ export interface StreamHandlers {
 	onReasoning?: (delta: string) => void;
 	onToolCallDelta?: (toolCalls: ToolCall[]) => void;
 	signal?: AbortSignal;
-	/** Platform fetch implementation (pass `window.fetch.bind(window)` from the plugin; Node tests pass global fetch). */
-	fetchImpl?: typeof fetch;
+	/** Platform fetch implementation (window.fetch in the plugin; injected fetch in Node tests), or a proxy-fetch. */
+	fetchImpl?: FetchLike;
 	/** Optional non-streaming fallback (e.g. Obsidian requestUrl to bypass CORS). */
 	fallbackPost?: (url: string, headers: Record<string, string>, body: string) => Promise<{ status: number; body: string }>;
 }
@@ -186,7 +188,7 @@ export interface AgentLoopOptions extends ChatRequestConfig {
 	onToolStart?: (call: ToolCall) => void;
 	onToolDone?: (call: ToolCall, result: { ok: boolean; content: string }) => void;
 	signal?: AbortSignal;
-	fetchImpl?: typeof fetch;
+	fetchImpl?: FetchLike;
 	fallbackPost?: StreamHandlers['fallbackPost'];
 }
 
