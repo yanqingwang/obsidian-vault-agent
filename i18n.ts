@@ -53,6 +53,20 @@ const zh = {
 	historyEvents: '条事件',
 	backToChat: '返回对话',
 	historyLoaded: '已载入会话',
+	searchMode: '联网搜索',
+	searchModeDesc: '让模型拿到训练数据之后的信息。服务商内置联网与插件搜索工具二选一（自动模式优先用内置）。',
+	searchModeOff: '关闭',
+	searchModeAuto: '自动（优先服务商内置）',
+	searchModeNative: '仅服务商内置',
+	searchModeTool: '仅插件工具（Tavily）',
+	searchApiKey: 'Tavily API Key',
+	searchApiKeyDesc: '仅保存在本机 Obsidian 配置内。到 app.tavily.com 注册后复制 Key，免费额度 1000 次/月。',
+	searchMaxResults: '每次搜索返回条数',
+	searchDepth: '搜索深度',
+	searchDepthBasic: 'basic（快，1 credit）',
+	searchDepthAdvanced: 'advanced（更全，2 credits）',
+	searchUnsupported: '当前服务商不提供内置联网。改用「仅插件工具」并填 Tavily Key，或换用 GLM / Kimi / Qwen / OpenRouter。',
+	searchFallback: '服务商拒绝了联网参数，本轮已按不联网重试。',
 } as const;
 
 type Dict = Record<keyof typeof zh, string>;
@@ -110,6 +124,20 @@ const en: Dict = {
 	historyEvents: 'events',
 	backToChat: 'Back to chat',
 	historyLoaded: 'Loaded session',
+	searchMode: 'Web search',
+	searchModeDesc: 'Give the model information past its training cut-off. Provider-native search and the plugin tool are alternatives (auto prefers native).',
+	searchModeOff: 'Off',
+	searchModeAuto: 'Auto (prefer provider-native)',
+	searchModeNative: 'Provider-native only',
+	searchModeTool: 'Plugin tool only (Tavily)',
+	searchApiKey: 'Tavily API key',
+	searchApiKeyDesc: 'Stored locally in Obsidian config only. Get a key at app.tavily.com — the free tier covers 1,000 searches/month.',
+	searchMaxResults: 'Results per search',
+	searchDepth: 'Search depth',
+	searchDepthBasic: 'basic (fast, 1 credit)',
+	searchDepthAdvanced: 'advanced (thorough, 2 credits)',
+	searchUnsupported: 'This provider has no native web search. Switch to "Plugin tool only" and add a Tavily key, or move to GLM / Kimi / Qwen / OpenRouter.',
+	searchFallback: 'The provider rejected the search parameters; this turn was retried without web search.',
 };
 
 export const STRINGS: Record<Lang, Dict> = { zh, en };

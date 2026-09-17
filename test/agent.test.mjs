@@ -206,6 +206,156 @@ const sseBody = chunks.join('');
 assert.ok(sseBody.includes('data:'), 'SSE body streamed through the proxy');
 assert.ok(sseBody.includes('笔记') || sseBody.includes('tool_calls'), 'proxied SSE payload intact');
 
+// 8. Native web search: vendor body fields and built-in tools reach the request.
+{
+	seenBodies.length = 0;
+	server.removeAllListeners('request');
+	server.on('request', (req, res) => {
+		let body = '';
+		req.on('data', d => body += d);
+		req.on('end', () => {
+			seenBodies.push(JSON.parse(body));
+			res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+			res.end(sse([{ content: 'ok' }, {}]));
+		});
+	});
+	await runAgentLoop({
+		baseUrl: `http://127.0.0.1:${port}`,
+		apiKey: 'sk-test',
+		model: 'test-model',
+		messages: [{ role: 'user', content: 'hi' }],
+		tools: [{ name: 'read_note', description: 'r', parameters: { type: 'object', properties: {} } }],
+		executor,
+		fetchImpl: fetch,
+		maxIterations: 2,
+		nativeSearch: {
+			tools: [{ type: 'web_search', web_search: { enable: 'True', count: '5' } }],
+			extraBody: { enable_search: true }
+		},
+		onText: () => {}
+	});
+	const sent = seenBodies[0];
+	assert.equal(sent.enable_search, true, 'extraBody lands in the request body');
+	assert.equal(sent.tools.length, 2, 'function tool + native tool');
+	assert.ok(sent.tools[0].function, 'vault tool keeps the OpenAI function shape');
+	assert.equal(sent.tools[1].type, 'web_search', 'native tool appended raw');
+	assert.equal(sent.tools[1].function, undefined, 'native tool must not be wrapped as a function');
+}
+
+// 9. The non-streaming fallback keeps the native fields.
+{
+	let fallbackBody = null;
+	const result = await runAgentLoop({
+		baseUrl: `http://127.0.0.1:${port}`,
+		apiKey: 'sk-test',
+		model: 'test-model',
+		messages: [{ role: 'user', content: 'hi' }],
+		tools: [],
+		executor,
+		fetchImpl: async () => { throw new Error('CORS'); },
+		fallbackPost: async (_url, _headers, body) => {
+			fallbackBody = JSON.parse(body);
+			return { status: 200, body: JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'from fallback' } }] }) };
+		},
+		maxIterations: 2,
+		nativeSearch: { extraBody: { enable_search: true } },
+		onText: () => {}
+	});
+	assert.equal(fallbackBody.stream, false, 'fallback is non-streaming');
+	assert.equal(fallbackBody.enable_search, true, 'fallback keeps the native field');
+	assert.equal(result.text, 'from fallback');
+}
+
+// 10. Provider built-in tools are echoed back verbatim, never executed.
+{
+	seenBodies.length = 0;
+	server.removeAllListeners('request');
+	let served = 0;
+	server.on('request', (req, res) => {
+		let body = '';
+		req.on('data', d => body += d);
+		req.on('end', () => {
+			seenBodies.push(JSON.parse(body));
+			res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+			served++;
+			res.end(served === 1
+				? sse([
+					{ tool_calls: [{ index: 0, id: 'ws_1', type: 'function', function: { name: '$web_search', arguments: '{"query":"obsidian 0.1.8"}' } }] },
+					{}
+				])
+				: sse([{ content: '搜到了' }, {}]));
+		});
+	});
+	let executedCount = 0;
+	const started = [];
+	const finished = [];
+	const result = await runAgentLoop({
+		baseUrl: `http://127.0.0.1:${port}`,
+		apiKey: 'sk-test',
+		model: 'test-model',
+		messages: [{ role: 'user', content: 'hi' }],
+		tools: [],
+		executor: { async execute() { executedCount++; return { ok: true, content: 'should not happen' }; } },
+		passthroughTools: ['$web_search'],
+		fetchImpl: fetch,
+		maxIterations: 3,
+		onText: () => {},
+		onToolStart: call => started.push(call.function.name),
+		onToolDone: (_call, res2) => finished.push(res2)
+	});
+	assert.equal(executedCount, 0, 'passthrough never reaches the executor');
+	assert.deepEqual(started, ['$web_search'], 'chip callback still fires');
+	assert.equal(finished.length, 1);
+	assert.equal(
+		seenBodies[1].messages.find(m => m.role === 'tool').content,
+		'{"query":"obsidian 0.1.8"}',
+		'arguments echoed back verbatim (this is what triggers the server-side search)'
+	);
+	assert.equal(result.text, '搜到了');
+}
+
+// 11. A provider that rejects the native field: retry once without it.
+{
+	seenBodies.length = 0;
+	server.removeAllListeners('request');
+	let served = 0;
+	server.on('request', (req, res) => {
+		let body = '';
+		req.on('data', d => body += d);
+		req.on('end', () => {
+			seenBodies.push(JSON.parse(body));
+			served++;
+			if (served === 1) {
+				res.writeHead(400, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ error: { message: 'unknown field: enable_search' } }));
+				return;
+			}
+			res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+			res.end(sse([{ content: '降级后成功' }, {}]));
+		});
+	});
+	const fallbacks = [];
+	const result = await runAgentLoop({
+		baseUrl: `http://127.0.0.1:${port}`,
+		apiKey: 'sk-test',
+		model: 'test-model',
+		messages: [{ role: 'user', content: 'hi' }],
+		tools: [],
+		executor,
+		fetchImpl: fetch,
+		maxIterations: 2,
+		nativeSearch: { extraBody: { enable_search: true } },
+		onSearchFallback: detail => fallbacks.push(detail),
+		onText: () => {}
+	});
+	assert.equal(seenBodies.length, 2, 'exactly one retry');
+	assert.equal(seenBodies[0].enable_search, true, 'first attempt carried the native field');
+	assert.equal(seenBodies[1].enable_search, undefined, 'retry dropped the native field');
+	assert.equal(fallbacks.length, 1, 'the downgrade is reported once');
+	assert.ok(fallbacks[0].includes('400'), 'reported detail carries the status');
+	assert.equal(result.text, '降级后成功', 'the turn still completes');
+}
+
 proxyServer.close();
 server.close();
 console.log('✅ all agent-loop tests passed');

@@ -1,7 +1,8 @@
 import { ItemView, WorkspaceLeaf, MarkdownRenderer, Notice, setIcon } from 'obsidian';
-import { ChatMessage, ToolCall, runAgentLoop, ToolDef, normalizeReasoning } from './agent';
+import { ChatMessage, ToolCall, runAgentLoop, ToolDef, ToolExecutor, normalizeReasoning } from './agent';
 import { FetchLike, makeProxyFetch } from './proxyFetch';
 import { parseHistory, sessionCursor, sessionTranscript, summarizeSessions, type HistoryEvent } from './history';
+import { buildWebSearchToolDef, createWebSearchExecutor, resolveSearch, WEB_SEARCH_TOOL_NAME, type SearchPost, type SearchSettings } from './search';
 import { t } from './i18n';
 import { VaultToolExecutor, buildToolDefs } from './tools';
 import type VaultAgentPlugin from './main';
@@ -357,7 +358,29 @@ export class AgentView extends ItemView {
 				? `当前打开的笔记：${active ? active.path : this.st('noActiveNote')}`
 				: `Active note: ${active ? active.path : '(none)'}`);
 		}
+		const search = resolveSearch(this.searchSettings());
+		if (search.tool) {
+			ctx.push(zhMode
+				? `联网搜索：需要最新信息或库外知识时，先调用 web_search 工具，再基于检索结果回答，并给出用到的来源链接。今天是 ${new Date().toISOString().slice(0, 10)}。`
+				: `Web search: for current information or anything outside the vault, call the web_search tool first, then answer from the results and cite the source links. Today is ${new Date().toISOString().slice(0, 10)}.`);
+		} else if (search.native) {
+			ctx.push(zhMode
+				? '联网搜索：当前服务商已内置联网，可以直接回答需要实时信息的问题。'
+				: 'Web search: native search is enabled for this provider, so you can answer live questions directly.');
+		}
 		return base + '\n\n' + ctx.join('\n');
+	}
+
+	/** Current web-search configuration, as the pure `search.ts` helpers expect it. */
+	private searchSettings(): SearchSettings {
+		const s = this.plugin.settings;
+		return {
+			mode: s.searchMode,
+			providerId: s.providerId,
+			apiKey: s.searchApiKey,
+			maxResults: s.searchMaxResults,
+			depth: s.searchDepth
+		};
 	}
 
 	private confirmWrite(summary: string): Promise<boolean> {
@@ -403,15 +426,33 @@ export class AgentView extends ItemView {
 		}
 
 		const stream = this.beginStreamingBubble();
+		const proxy = s.proxyUrl.trim();
+		const fetchImpl: FetchLike = proxy ? makeProxyFetch(proxy) : (url, init) => window.fetch(url, init);
+		// One egress for everything: the local proxy when configured, otherwise
+		// Obsidian's requestUrl (no CORS, and it works on mobile).
+		const post: SearchPost = proxy
+			? async (url, headers, body) => {
+				const r = await fetchImpl(url, { method: 'POST', headers, body });
+				return { status: r.status, body: await r.text() };
+			}
+			: (url, headers, body) => this.plugin.fallbackPost(url, headers, body);
+
+		const search = resolveSearch(this.searchSettings());
 		const tools: ToolDef[] = buildToolDefs();
-		const executor = new VaultToolExecutor(this.app, () => this.app.workspace.getActiveFile()?.path ?? null);
+		if (search.tool) tools.push(buildWebSearchToolDef());
+		const vaultExecutor = new VaultToolExecutor(this.app, () => this.app.workspace.getActiveFile()?.path ?? null);
+		const searchExecutor = createWebSearchExecutor(post, () => this.searchSettings());
+		// Two delegates, so the vault executor never learns about the network tool.
+		const executor: ToolExecutor = {
+			execute: (name, args) => name === WEB_SEARCH_TOOL_NAME
+				? searchExecutor.execute(name, args)
+				: vaultExecutor.execute(name, args)
+		};
 		// Tool calls execute sequentially: chips complete in FIFO order.
 		const chipQueue: HTMLElement[] = [];
 		const toolStartedAt = new Map<string, number>();
 
 		try {
-			const proxy = s.proxyUrl.trim();
-			const fetchImpl: FetchLike = proxy ? makeProxyFetch(proxy) : (url, init) => window.fetch(url, init);
 			const { text, reasoning, hitCap } = await runAgentLoop({
 				baseUrl: s.baseUrl,
 				apiKey: s.apiKey,
@@ -422,15 +463,13 @@ export class AgentView extends ItemView {
 				messages: this.messages,
 				tools,
 				executor,
+				nativeSearch: search.native ?? undefined,
+				passthroughTools: search.native?.passthrough,
+				onSearchFallback: () => new Notice(this.st('searchFallback')),
 				signal: this.abort.signal,
 				confirmWrite: (summary) => this.confirmWrite(summary),
 				fetchImpl,
-				fallbackPost: proxy
-					? async (url, headers, body) => {
-						const r = await fetchImpl(url, { method: 'POST', headers, body });
-						return { status: r.status, body: await r.text() };
-					}
-					: (url, headers, body) => this.plugin.fallbackPost(url, headers, body),
+				fallbackPost: post,
 				onText: d => stream.push(d),
 				onReasoning: d => stream.pushReasoning(d),
 				onToolStart: call => {

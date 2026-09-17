@@ -26,12 +26,21 @@ export interface ToolDef {
 	x_write?: boolean;
 }
 
+/** Provider-native web search: extra request-body fields and built-in tools. */
+export interface NativeSearchRequest {
+	/** Raw entries appended to the body's `tools` array (not wrapped as functions). */
+	tools?: unknown[];
+	/** Top-level body fields, e.g. `enable_search` or `plugins`. */
+	extraBody?: Record<string, unknown>;
+}
+
 export interface ChatRequestConfig {
 	baseUrl: string;
 	apiKey: string;
 	model: string;
 	temperature?: number;
 	maxTokens?: number;
+	nativeSearch?: NativeSearchRequest;
 }
 
 export interface StreamHandlers {
@@ -43,6 +52,8 @@ export interface StreamHandlers {
 	fetchImpl?: FetchLike;
 	/** Optional non-streaming fallback (e.g. Obsidian requestUrl to bypass CORS). */
 	fallbackPost?: (url: string, headers: Record<string, string>, body: string) => Promise<{ status: number; body: string }>;
+	/** Called when the provider rejected the native search declaration and we retried without it. */
+	onSearchFallback?: (detail: string) => void;
 }
 
 interface AssistantTurn {
@@ -58,27 +69,37 @@ export async function chatCompletion(cfg: ChatRequestConfig, messages: ChatMessa
 		'Content-Type': 'application/json',
 		Authorization: 'Bearer ' + cfg.apiKey
 	};
-	const payload = {
-		model: cfg.model,
-		messages,
-		temperature: cfg.temperature ?? 0.7,
-		max_tokens: cfg.maxTokens ?? 8192,
-		stream: true,
-		tools: tools.length
-			? tools.map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }))
-			: undefined
+	const fnTools = tools.length
+		? tools.map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }))
+		: [];
+	const nativeTools = cfg.nativeSearch?.tools ?? [];
+	// Native declarations are vendor-specific: an unknown body field or tool type
+	// can make a provider reject the whole request, so the caller retries once
+	// with `withNative: false` before giving up on the turn.
+	let withNative = nativeTools.length > 0 || cfg.nativeSearch?.extraBody !== undefined;
+	const buildPayload = (include: boolean): Record<string, unknown> => {
+		const allTools = include ? [...fnTools, ...nativeTools] : fnTools;
+		return {
+			// Spread first so vendor extras can never clobber model/messages.
+			...(include ? cfg.nativeSearch?.extraBody ?? {} : {}),
+			model: cfg.model,
+			messages,
+			temperature: cfg.temperature ?? 0.7,
+			max_tokens: cfg.maxTokens ?? 8192,
+			stream: true,
+			tools: allTools.length ? allTools : undefined
+		};
 	};
-	const body = JSON.stringify(payload);
 
 	const turn: AssistantTurn = { content: null, reasoning: null, toolCalls: [] };
-	try {
+	const sendStream = async (): Promise<void> => {
 		// Obsidian's requestUrl cannot stream responses, so streaming goes through the
 		// platform fetch implementation injected by the host (window.fetch in the plugin).
 		if (!h.fetchImpl) throw new Error('no streaming fetch implementation provided');
 		const res = await h.fetchImpl(url, {
 			method: 'POST',
 			headers,
-			body,
+			body: JSON.stringify(buildPayload(withNative)),
 			signal: h.signal
 		});
 		if (!res.ok) {
@@ -87,10 +108,26 @@ export async function chatCompletion(cfg: ChatRequestConfig, messages: ChatMessa
 		}
 		if (!res.body) throw new Error('empty response body');
 		await consumeSse(res.body, (data) => applyChunk(data, turn, h));
+	};
+
+	try {
+		try {
+			await sendStream();
+		} catch (e: unknown) {
+			// A provider that rejects our native search declaration (unknown field or
+			// tool type) must not cost the user the whole turn: drop it and retry once.
+			const message = e instanceof Error ? e.message : String(e);
+			const idle = turn.content === null && turn.toolCalls.length === 0;
+			const rejected = /^HTTP (400|404|422)\b/.test(message);
+			if (!withNative || !rejected || !idle || h.signal?.aborted) throw e;
+			withNative = false;
+			h.onSearchFallback?.(message);
+			await sendStream();
+		}
 	} catch (e: unknown) {
 		// Network/CORS/unsupported-stream failures: retry once without streaming.
 		if (h.fallbackPost && !(h.signal?.aborted)) {
-			const out = await h.fallbackPost(url, headers, JSON.stringify({ ...payload, stream: false }));
+			const out = await h.fallbackPost(url, headers, JSON.stringify({ ...buildPayload(withNative), stream: false }));
 			if (out.status >= 400) throw new Error(`HTTP ${out.status}: ${truncate(out.body, 500)}`);
 			applyChunk(out.body || '{}', turn, h, true);
 		} else {
@@ -187,6 +224,9 @@ export interface AgentLoopOptions extends ChatRequestConfig {
 	onReasoning?: (delta: string) => void;
 	onToolStart?: (call: ToolCall) => void;
 	onToolDone?: (call: ToolCall, result: { ok: boolean; content: string }) => void;
+	/** Provider built-in tools (e.g. Kimi's `$web_search`) whose arguments are echoed back, not executed. */
+	passthroughTools?: string[];
+	onSearchFallback?: (detail: string) => void;
 	signal?: AbortSignal;
 	fetchImpl?: FetchLike;
 	fallbackPost?: StreamHandlers['fallbackPost'];
@@ -210,6 +250,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
 		const turn = await chatCompletion(opts, opts.messages, opts.tools, {
 			onText: opts.onText,
 			onReasoning: opts.onReasoning,
+			onSearchFallback: opts.onSearchFallback,
 			signal: opts.signal,
 			fetchImpl: opts.fetchImpl,
 			fallbackPost: opts.fallbackPost
@@ -228,13 +269,20 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
 			opts.onToolStart?.(call);
 			let result = { ok: false, content: 'blocked before execution' };
 			try {
-				const args: unknown = JSON.parse(call.function.arguments || '{}');
-				// Write actions may require explicit user confirmation.
-				const def = opts.tools.find(t => t.name === call.function.name);
-				if (def?.x_write && opts.confirmWrite && !(await opts.confirmWrite(`${call.function.name}: ${truncate(JSON.stringify(args), 200)}`))) {
-					result = { ok: false, content: 'USER_DENIED' };
+				if (opts.passthroughTools?.includes(call.function.name)) {
+					// Vendor built-in (e.g. Kimi's $web_search): echoing the arguments
+					// back verbatim is what makes the server run the search. Nothing is
+					// parsed or executed here, and the chip/history callbacks still fire.
+					result = { ok: true, content: call.function.arguments || '{}' };
 				} else {
-					result = await opts.executor.execute(call.function.name, call.function.arguments);
+					const args: unknown = JSON.parse(call.function.arguments || '{}');
+					// Write actions may require explicit user confirmation.
+					const def = opts.tools.find(t => t.name === call.function.name);
+					if (def?.x_write && opts.confirmWrite && !(await opts.confirmWrite(`${call.function.name}: ${truncate(JSON.stringify(args), 200)}`))) {
+						result = { ok: false, content: 'USER_DENIED' };
+					} else {
+						result = await opts.executor.execute(call.function.name, call.function.arguments);
+					}
 				}
 			} catch (e: unknown) {
 				result = { ok: false, content: 'tool error: ' + (e instanceof Error ? e.message : String(e)) };

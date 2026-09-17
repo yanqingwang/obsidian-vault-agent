@@ -40,23 +40,30 @@ async function chatCompletion(cfg, messages, tools, h) {
     "Content-Type": "application/json",
     Authorization: "Bearer " + cfg.apiKey
   };
-  const payload = {
-    model: cfg.model,
-    messages,
-    temperature: cfg.temperature ?? 0.7,
-    max_tokens: cfg.maxTokens ?? 8192,
-    stream: true,
-    tools: tools.length ? tools.map((t2) => ({ type: "function", function: { name: t2.name, description: t2.description, parameters: t2.parameters } })) : void 0
+  const fnTools = tools.length ? tools.map((t2) => ({ type: "function", function: { name: t2.name, description: t2.description, parameters: t2.parameters } })) : [];
+  const nativeTools = cfg.nativeSearch?.tools ?? [];
+  let withNative = nativeTools.length > 0 || cfg.nativeSearch?.extraBody !== void 0;
+  const buildPayload = (include) => {
+    const allTools = include ? [...fnTools, ...nativeTools] : fnTools;
+    return {
+      // Spread first so vendor extras can never clobber model/messages.
+      ...include ? cfg.nativeSearch?.extraBody ?? {} : {},
+      model: cfg.model,
+      messages,
+      temperature: cfg.temperature ?? 0.7,
+      max_tokens: cfg.maxTokens ?? 8192,
+      stream: true,
+      tools: allTools.length ? allTools : void 0
+    };
   };
-  const body = JSON.stringify(payload);
   const turn = { content: null, reasoning: null, toolCalls: [] };
-  try {
+  const sendStream = async () => {
     if (!h.fetchImpl)
       throw new Error("no streaming fetch implementation provided");
     const res = await h.fetchImpl(url, {
       method: "POST",
       headers,
-      body,
+      body: JSON.stringify(buildPayload(withNative)),
       signal: h.signal
     });
     if (!res.ok) {
@@ -66,9 +73,23 @@ async function chatCompletion(cfg, messages, tools, h) {
     if (!res.body)
       throw new Error("empty response body");
     await consumeSse(res.body, (data) => applyChunk(data, turn, h));
+  };
+  try {
+    try {
+      await sendStream();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      const idle = turn.content === null && turn.toolCalls.length === 0;
+      const rejected = /^HTTP (400|404|422)\b/.test(message);
+      if (!withNative || !rejected || !idle || h.signal?.aborted)
+        throw e;
+      withNative = false;
+      h.onSearchFallback?.(message);
+      await sendStream();
+    }
   } catch (e) {
     if (h.fallbackPost && !h.signal?.aborted) {
-      const out = await h.fallbackPost(url, headers, JSON.stringify({ ...payload, stream: false }));
+      const out = await h.fallbackPost(url, headers, JSON.stringify({ ...buildPayload(withNative), stream: false }));
       if (out.status >= 400)
         throw new Error(`HTTP ${out.status}: ${truncate(out.body, 500)}`);
       applyChunk(out.body || "{}", turn, h, true);
@@ -165,6 +186,7 @@ async function runAgentLoop(opts) {
     const turn = await chatCompletion(opts, opts.messages, opts.tools, {
       onText: opts.onText,
       onReasoning: opts.onReasoning,
+      onSearchFallback: opts.onSearchFallback,
       signal: opts.signal,
       fetchImpl: opts.fetchImpl,
       fallbackPost: opts.fallbackPost
@@ -184,12 +206,16 @@ async function runAgentLoop(opts) {
       opts.onToolStart?.(call);
       let result = { ok: false, content: "blocked before execution" };
       try {
-        const args = JSON.parse(call.function.arguments || "{}");
-        const def = opts.tools.find((t2) => t2.name === call.function.name);
-        if (def?.x_write && opts.confirmWrite && !await opts.confirmWrite(`${call.function.name}: ${truncate(JSON.stringify(args), 200)}`)) {
-          result = { ok: false, content: "USER_DENIED" };
+        if (opts.passthroughTools?.includes(call.function.name)) {
+          result = { ok: true, content: call.function.arguments || "{}" };
         } else {
-          result = await opts.executor.execute(call.function.name, call.function.arguments);
+          const args = JSON.parse(call.function.arguments || "{}");
+          const def = opts.tools.find((t2) => t2.name === call.function.name);
+          if (def?.x_write && opts.confirmWrite && !await opts.confirmWrite(`${call.function.name}: ${truncate(JSON.stringify(args), 200)}`)) {
+            result = { ok: false, content: "USER_DENIED" };
+          } else {
+            result = await opts.executor.execute(call.function.name, call.function.arguments);
+          }
         }
       } catch (e) {
         result = { ok: false, content: "tool error: " + (e instanceof Error ? e.message : String(e)) };
@@ -551,6 +577,165 @@ function firstUserText(ordered) {
   return (first?.content ?? "").replace(/\s+/g, " ").trim();
 }
 
+// search.ts
+var WEB_SEARCH_TOOL_NAME = "web_search";
+var TAVILY_URL = "https://api.tavily.com/search";
+function nativeSearchFor(providerId, maxResults) {
+  const count = clampResults(maxResults);
+  switch (providerId) {
+    case "glm":
+    case "zai":
+      return {
+        tools: [
+          {
+            type: "web_search",
+            web_search: {
+              enable: "True",
+              search_engine: "search_pro",
+              search_result: "True",
+              count: String(count)
+            }
+          }
+        ]
+      };
+    case "kimi":
+      return {
+        tools: [{ type: "builtin_function", function: { name: "$web_search" } }],
+        passthrough: ["$web_search"]
+      };
+    case "qwen":
+      return { extraBody: { enable_search: true } };
+    case "openrouter":
+      return { extraBody: { plugins: [{ id: "web" }] } };
+    case "ark":
+      return null;
+    default:
+      return null;
+  }
+}
+function resolveSearch(s) {
+  if (s.mode === "off")
+    return { native: null, tool: false, reason: "off" };
+  const native = s.mode === "tool" ? null : nativeSearchFor(s.providerId, s.maxResults);
+  const hasKey = s.apiKey.trim().length > 0;
+  if (s.mode === "native")
+    return native ? { native, tool: false } : { native: null, tool: false, reason: "provider-unsupported" };
+  if (s.mode === "tool")
+    return hasKey ? { native: null, tool: true } : { native: null, tool: false, reason: "no-key" };
+  if (native)
+    return { native, tool: false };
+  return hasKey ? { native: null, tool: true } : { native: null, tool: false, reason: "no-key" };
+}
+function buildWebSearchToolDef() {
+  return {
+    name: WEB_SEARCH_TOOL_NAME,
+    description: "Search the live web for current information (news, releases, prices, anything after the model knowledge cut-off) or facts that are not in the vault. Returns titles, URLs and excerpts \u2014 cite the URLs you used.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search query, as specific as possible" },
+        max_results: { type: "integer", description: "How many results to return (1-20)" }
+      },
+      required: ["query"]
+    }
+  };
+}
+function buildTavilyBody(query, s, overrideResults) {
+  return {
+    query: query.trim().slice(0, 400),
+    search_depth: s.depth,
+    max_results: clampResults(overrideResults ?? s.maxResults),
+    // The model reasons over the excerpts itself; a pre-chewed answer only
+    // costs tokens and hides the sources.
+    include_answer: false
+  };
+}
+function formatTavilyResults(parsed) {
+  const data = asRecord2(parsed);
+  if (!data)
+    return { ok: false, content: "web search failed: unparsable response" };
+  const error = errorMessage(data);
+  if (error)
+    return { ok: false, content: `web search failed: ${error}` };
+  const results = Array.isArray(data.results) ? data.results : [];
+  if (!results.length)
+    return { ok: true, content: "(no results)" };
+  const blocks = results.map((raw, i) => {
+    const item = asRecord2(raw) ?? {};
+    const title = asString(item.title) || "(untitled)";
+    const link = asString(item.url);
+    const excerpt2 = oneLine(asString(item.content)).slice(0, 600);
+    return [`${i + 1}. ${title}`, link ? `   ${link}` : "", excerpt2 ? `   ${excerpt2}` : ""].filter(Boolean).join("\n");
+  });
+  const answer = oneLine(asString(data.answer));
+  return { ok: true, content: (answer ? `answer: ${answer}
+
+` : "") + blocks.join("\n") };
+}
+function createWebSearchExecutor(post, getSettings) {
+  return {
+    async execute(name, argsJson) {
+      if (name !== WEB_SEARCH_TOOL_NAME)
+        return { ok: false, content: `unknown tool: ${name}` };
+      const settings = getSettings();
+      const apiKey = settings.apiKey.trim();
+      if (!apiKey)
+        return { ok: false, content: "web search is not configured: add a Tavily API key in the plugin settings" };
+      let args;
+      try {
+        args = asRecord2(JSON.parse(argsJson || "{}")) ?? {};
+      } catch {
+        return { ok: false, content: "invalid JSON arguments" };
+      }
+      const query = asString(args.query).trim();
+      if (!query)
+        return { ok: false, content: "web search needs a non-empty query" };
+      const override = typeof args.max_results === "number" ? args.max_results : void 0;
+      try {
+        const res = await post(
+          TAVILY_URL,
+          { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+          JSON.stringify(buildTavilyBody(query, settings, override))
+        );
+        if (res.status >= 400) {
+          return { ok: false, content: `web search failed: HTTP ${res.status}: ${truncate(res.body, 300)}` };
+        }
+        let parsed;
+        try {
+          parsed = JSON.parse(res.body);
+        } catch {
+          return { ok: false, content: "web search failed: non-JSON response" };
+        }
+        return formatTavilyResults(parsed);
+      } catch (e) {
+        return { ok: false, content: "web search failed: " + (e instanceof Error ? e.message : String(e)) };
+      }
+    }
+  };
+}
+function clampResults(n) {
+  if (!Number.isFinite(n))
+    return 5;
+  return Math.min(20, Math.max(1, Math.round(n)));
+}
+function asRecord2(value) {
+  return value !== null && typeof value === "object" ? value : null;
+}
+function asString(value) {
+  return typeof value === "string" ? value : "";
+}
+function oneLine(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+function errorMessage(data) {
+  if (typeof data.error === "string")
+    return data.error;
+  const detail = asRecord2(data.detail);
+  if (detail && typeof detail.error === "string")
+    return detail.error;
+  return "";
+}
+
 // i18n.ts
 var zh = {
   viewName: "Vault Agent",
@@ -604,7 +789,21 @@ var zh = {
   historyNoUser: "\uFF08\u65E0\u7528\u6237\u6D88\u606F\uFF09",
   historyEvents: "\u6761\u4E8B\u4EF6",
   backToChat: "\u8FD4\u56DE\u5BF9\u8BDD",
-  historyLoaded: "\u5DF2\u8F7D\u5165\u4F1A\u8BDD"
+  historyLoaded: "\u5DF2\u8F7D\u5165\u4F1A\u8BDD",
+  searchMode: "\u8054\u7F51\u641C\u7D22",
+  searchModeDesc: "\u8BA9\u6A21\u578B\u62FF\u5230\u8BAD\u7EC3\u6570\u636E\u4E4B\u540E\u7684\u4FE1\u606F\u3002\u670D\u52A1\u5546\u5185\u7F6E\u8054\u7F51\u4E0E\u63D2\u4EF6\u641C\u7D22\u5DE5\u5177\u4E8C\u9009\u4E00\uFF08\u81EA\u52A8\u6A21\u5F0F\u4F18\u5148\u7528\u5185\u7F6E\uFF09\u3002",
+  searchModeOff: "\u5173\u95ED",
+  searchModeAuto: "\u81EA\u52A8\uFF08\u4F18\u5148\u670D\u52A1\u5546\u5185\u7F6E\uFF09",
+  searchModeNative: "\u4EC5\u670D\u52A1\u5546\u5185\u7F6E",
+  searchModeTool: "\u4EC5\u63D2\u4EF6\u5DE5\u5177\uFF08Tavily\uFF09",
+  searchApiKey: "Tavily API Key",
+  searchApiKeyDesc: "\u4EC5\u4FDD\u5B58\u5728\u672C\u673A Obsidian \u914D\u7F6E\u5185\u3002\u5230 app.tavily.com \u6CE8\u518C\u540E\u590D\u5236 Key\uFF0C\u514D\u8D39\u989D\u5EA6 1000 \u6B21/\u6708\u3002",
+  searchMaxResults: "\u6BCF\u6B21\u641C\u7D22\u8FD4\u56DE\u6761\u6570",
+  searchDepth: "\u641C\u7D22\u6DF1\u5EA6",
+  searchDepthBasic: "basic\uFF08\u5FEB\uFF0C1 credit\uFF09",
+  searchDepthAdvanced: "advanced\uFF08\u66F4\u5168\uFF0C2 credits\uFF09",
+  searchUnsupported: "\u5F53\u524D\u670D\u52A1\u5546\u4E0D\u63D0\u4F9B\u5185\u7F6E\u8054\u7F51\u3002\u6539\u7528\u300C\u4EC5\u63D2\u4EF6\u5DE5\u5177\u300D\u5E76\u586B Tavily Key\uFF0C\u6216\u6362\u7528 GLM / Kimi / Qwen / OpenRouter\u3002",
+  searchFallback: "\u670D\u52A1\u5546\u62D2\u7EDD\u4E86\u8054\u7F51\u53C2\u6570\uFF0C\u672C\u8F6E\u5DF2\u6309\u4E0D\u8054\u7F51\u91CD\u8BD5\u3002"
 };
 var en = {
   viewName: "Vault Agent",
@@ -658,7 +857,21 @@ var en = {
   historyNoUser: "(no user message)",
   historyEvents: "events",
   backToChat: "Back to chat",
-  historyLoaded: "Loaded session"
+  historyLoaded: "Loaded session",
+  searchMode: "Web search",
+  searchModeDesc: "Give the model information past its training cut-off. Provider-native search and the plugin tool are alternatives (auto prefers native).",
+  searchModeOff: "Off",
+  searchModeAuto: "Auto (prefer provider-native)",
+  searchModeNative: "Provider-native only",
+  searchModeTool: "Plugin tool only (Tavily)",
+  searchApiKey: "Tavily API key",
+  searchApiKeyDesc: "Stored locally in Obsidian config only. Get a key at app.tavily.com \u2014 the free tier covers 1,000 searches/month.",
+  searchMaxResults: "Results per search",
+  searchDepth: "Search depth",
+  searchDepthBasic: "basic (fast, 1 credit)",
+  searchDepthAdvanced: "advanced (thorough, 2 credits)",
+  searchUnsupported: 'This provider has no native web search. Switch to "Plugin tool only" and add a Tavily key, or move to GLM / Kimi / Qwen / OpenRouter.',
+  searchFallback: "The provider rejected the search parameters; this turn was retried without web search."
 };
 var STRINGS = { zh, en };
 function t(lang, key) {
@@ -1292,7 +1505,24 @@ var AgentView = class extends import_obsidian2.ItemView {
     if (s.autoContext) {
       ctx.push(zhMode ? `\u5F53\u524D\u6253\u5F00\u7684\u7B14\u8BB0\uFF1A${active ? active.path : this.st("noActiveNote")}` : `Active note: ${active ? active.path : "(none)"}`);
     }
+    const search = resolveSearch(this.searchSettings());
+    if (search.tool) {
+      ctx.push(zhMode ? `\u8054\u7F51\u641C\u7D22\uFF1A\u9700\u8981\u6700\u65B0\u4FE1\u606F\u6216\u5E93\u5916\u77E5\u8BC6\u65F6\uFF0C\u5148\u8C03\u7528 web_search \u5DE5\u5177\uFF0C\u518D\u57FA\u4E8E\u68C0\u7D22\u7ED3\u679C\u56DE\u7B54\uFF0C\u5E76\u7ED9\u51FA\u7528\u5230\u7684\u6765\u6E90\u94FE\u63A5\u3002\u4ECA\u5929\u662F ${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}\u3002` : `Web search: for current information or anything outside the vault, call the web_search tool first, then answer from the results and cite the source links. Today is ${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.`);
+    } else if (search.native) {
+      ctx.push(zhMode ? "\u8054\u7F51\u641C\u7D22\uFF1A\u5F53\u524D\u670D\u52A1\u5546\u5DF2\u5185\u7F6E\u8054\u7F51\uFF0C\u53EF\u4EE5\u76F4\u63A5\u56DE\u7B54\u9700\u8981\u5B9E\u65F6\u4FE1\u606F\u7684\u95EE\u9898\u3002" : "Web search: native search is enabled for this provider, so you can answer live questions directly.");
+    }
     return base + "\n\n" + ctx.join("\n");
+  }
+  /** Current web-search configuration, as the pure `search.ts` helpers expect it. */
+  searchSettings() {
+    const s = this.plugin.settings;
+    return {
+      mode: s.searchMode,
+      providerId: s.providerId,
+      apiKey: s.searchApiKey,
+      maxResults: s.searchMaxResults,
+      depth: s.searchDepth
+    };
   }
   confirmWrite(summary) {
     const s = this.plugin.settings;
@@ -1340,13 +1570,24 @@ var AgentView = class extends import_obsidian2.ItemView {
       this.messages[0].content = this.buildSystemPrompt();
     }
     const stream = this.beginStreamingBubble();
+    const proxy = s.proxyUrl.trim();
+    const fetchImpl = proxy ? makeProxyFetch(proxy) : (url, init) => window.fetch(url, init);
+    const post = proxy ? async (url, headers, body) => {
+      const r = await fetchImpl(url, { method: "POST", headers, body });
+      return { status: r.status, body: await r.text() };
+    } : (url, headers, body) => this.plugin.fallbackPost(url, headers, body);
+    const search = resolveSearch(this.searchSettings());
     const tools = buildToolDefs();
-    const executor = new VaultToolExecutor(this.app, () => this.app.workspace.getActiveFile()?.path ?? null);
+    if (search.tool)
+      tools.push(buildWebSearchToolDef());
+    const vaultExecutor = new VaultToolExecutor(this.app, () => this.app.workspace.getActiveFile()?.path ?? null);
+    const searchExecutor = createWebSearchExecutor(post, () => this.searchSettings());
+    const executor = {
+      execute: (name, args) => name === WEB_SEARCH_TOOL_NAME ? searchExecutor.execute(name, args) : vaultExecutor.execute(name, args)
+    };
     const chipQueue = [];
     const toolStartedAt = /* @__PURE__ */ new Map();
     try {
-      const proxy = s.proxyUrl.trim();
-      const fetchImpl = proxy ? makeProxyFetch(proxy) : (url, init) => window.fetch(url, init);
       const { text, reasoning, hitCap } = await runAgentLoop({
         baseUrl: s.baseUrl,
         apiKey: s.apiKey,
@@ -1357,13 +1598,13 @@ var AgentView = class extends import_obsidian2.ItemView {
         messages: this.messages,
         tools,
         executor,
+        nativeSearch: search.native ?? void 0,
+        passthroughTools: search.native?.passthrough,
+        onSearchFallback: () => new import_obsidian2.Notice(this.st("searchFallback")),
         signal: this.abort.signal,
         confirmWrite: (summary) => this.confirmWrite(summary),
         fetchImpl,
-        fallbackPost: proxy ? async (url, headers, body) => {
-          const r = await fetchImpl(url, { method: "POST", headers, body });
-          return { status: r.status, body: await r.text() };
-        } : (url, headers, body) => this.plugin.fallbackPost(url, headers, body),
+        fallbackPost: post,
         onText: (d) => stream.push(d),
         onReasoning: (d) => stream.pushReasoning(d),
         onToolStart: (call) => {
@@ -1434,7 +1675,11 @@ var DEFAULT_SETTINGS = {
   systemPrompt: "",
   lang: "zh",
   history: [],
-  sessionId: ""
+  sessionId: "",
+  searchMode: "off",
+  searchApiKey: "",
+  searchMaxResults: 5,
+  searchDepth: "basic"
 };
 var VaultAgentPlugin = class extends import_obsidian3.Plugin {
   constructor() {
@@ -1643,6 +1888,66 @@ var VASettingTab = class extends import_obsidian3.PluginSettingTab {
         name: this.st("systemPrompt"),
         desc: this.st("systemPromptDesc"),
         control: { type: "textarea", key: "systemPrompt", rows: 4 }
+      },
+      ...this.searchSettingDefinitions()
+    ];
+  }
+  /** Web-search settings; shared by the declarative and the legacy settings UI. */
+  searchSettingDefinitions() {
+    const usesTool = () => ["auto", "tool"].includes(this.plugin.settings.searchMode);
+    const nativeUnsupported = () => {
+      const s = this.plugin.settings;
+      return s.searchMode === "native" && !nativeSearchFor(s.providerId, s.searchMaxResults);
+    };
+    return [
+      {
+        name: this.st("searchMode"),
+        desc: this.st("searchModeDesc"),
+        control: {
+          type: "dropdown",
+          key: "searchMode",
+          options: {
+            off: this.st("searchModeOff"),
+            auto: this.st("searchModeAuto"),
+            native: this.st("searchModeNative"),
+            tool: this.st("searchModeTool")
+          }
+        }
+      },
+      {
+        name: this.st("searchApiKey"),
+        desc: this.st("searchApiKeyDesc"),
+        visible: usesTool,
+        control: { type: "text", key: "searchApiKey" }
+      },
+      {
+        name: this.st("searchMaxResults"),
+        visible: usesTool,
+        control: {
+          type: "number",
+          key: "searchMaxResults",
+          step: 1,
+          validate: (v) => typeof v === "number" && v >= 1 && v <= 20 ? void 0 : "must be 1-20"
+        }
+      },
+      {
+        name: this.st("searchDepth"),
+        visible: usesTool,
+        control: {
+          type: "dropdown",
+          key: "searchDepth",
+          options: { basic: this.st("searchDepthBasic"), advanced: this.st("searchDepthAdvanced") }
+        }
+      },
+      {
+        // Description-only row: no control, just the explanation.
+        name: this.st("searchUnsupported"),
+        searchable: false,
+        visible: nativeUnsupported,
+        render: (setting) => {
+          setting.settingEl.addClass("va-hint");
+          return () => setting.settingEl.removeClass("va-hint");
+        }
       }
     ];
   }
@@ -1666,6 +1971,7 @@ var VASettingTab = class extends import_obsidian3.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     const s = this.plugin.settings;
+    let searchEl = null;
     new import_obsidian3.Setting(containerEl).setName(this.st("settingsHeading")).setHeading();
     new import_obsidian3.Setting(containerEl).setName(this.st("language")).setDesc(this.st("languageDesc")).addDropdown((d) => d.addOption("zh", "\u4E2D\u6587").addOption("en", "English").setValue(s.lang).onChange(async (v) => {
       s.lang = v;
@@ -1685,6 +1991,8 @@ var VASettingTab = class extends import_obsidian3.PluginSettingTab {
         s.providerId = v;
         await this.plugin.saveSettings();
         this.renderProviderExtras(containerEl);
+        if (searchEl)
+          this.renderSearchSettings(searchEl);
       });
     });
     new import_obsidian3.Setting(containerEl).setName(this.st("baseUrl")).addText((tx) => tx.setValue(s.baseUrl).onChange(async (v) => {
@@ -1736,6 +2044,47 @@ var VASettingTab = class extends import_obsidian3.PluginSettingTab {
     }));
     new import_obsidian3.Setting(containerEl).setName(this.st("systemPrompt")).setDesc(this.st("systemPromptDesc")).addTextArea((ta) => ta.setValue(s.systemPrompt).onChange(async (v) => {
       s.systemPrompt = v;
+      await this.plugin.saveSettings();
+    }));
+    searchEl = containerEl.createDiv({ cls: "va-search-settings" });
+    this.renderSearchSettings(searchEl);
+  }
+  /**
+   * Web-search settings for the legacy (pre-1.13) settings UI. Re-rendered in
+   * place when the mode or provider changes, because several rows are conditional.
+   */
+  renderSearchSettings(el) {
+    const s = this.plugin.settings;
+    el.empty();
+    const usesTool = () => ["auto", "tool"].includes(s.searchMode);
+    const rerender = () => this.renderSearchSettings(el);
+    new import_obsidian3.Setting(el).setName(this.st("searchMode")).setDesc(this.st("searchModeDesc")).addDropdown((d) => d.addOption("off", this.st("searchModeOff")).addOption("auto", this.st("searchModeAuto")).addOption("native", this.st("searchModeNative")).addOption("tool", this.st("searchModeTool")).setValue(s.searchMode).onChange(async (v) => {
+      s.searchMode = v;
+      await this.plugin.saveSettings();
+      rerender();
+    }));
+    if (s.searchMode === "native" && !nativeSearchFor(s.providerId, s.searchMaxResults)) {
+      const hint = new import_obsidian3.Setting(el).setClass("va-hint");
+      hint.nameEl.setText("\u26A0\uFE0F " + this.st("searchUnsupported"));
+    }
+    if (!usesTool())
+      return;
+    new import_obsidian3.Setting(el).setName(this.st("searchApiKey")).setDesc(this.st("searchApiKeyDesc")).addText((tx) => {
+      tx.inputEl.type = "password";
+      tx.setValue(s.searchApiKey).onChange(async (v) => {
+        s.searchApiKey = v.trim();
+        await this.plugin.saveSettings();
+      });
+    });
+    new import_obsidian3.Setting(el).setName(this.st("searchMaxResults")).addText((tx) => tx.setValue(String(s.searchMaxResults)).onChange(async (v) => {
+      const n = parseInt(v, 10);
+      if (n >= 1 && n <= 20) {
+        s.searchMaxResults = n;
+        await this.plugin.saveSettings();
+      }
+    }));
+    new import_obsidian3.Setting(el).setName(this.st("searchDepth")).addDropdown((d) => d.addOption("basic", this.st("searchDepthBasic")).addOption("advanced", this.st("searchDepthAdvanced")).setValue(s.searchDepth).onChange(async (v) => {
+      s.searchDepth = v;
       await this.plugin.saveSettings();
     }));
   }

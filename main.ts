@@ -1,6 +1,7 @@
 import { App, Plugin, PluginSettingTab, Setting, normalizePath, requestUrl, WorkspaceLeaf, type SettingDefinitionItem } from 'obsidian';
 import { AgentView, VIEW_TYPE_AGENT } from './view';
 import { HistoryRecorder, newSessionId, type HistoryMeta, type SessionCursor } from './history';
+import { nativeSearchFor, type SearchDepth, type SearchMode } from './search';
 import { t, Lang } from './i18n';
 
 export interface ProviderPreset {
@@ -41,6 +42,11 @@ export interface VASettings {
 	history: ChatMessage[];
 	/** Id of the conversation currently being appended to history.jsonl. */
 	sessionId: string;
+	searchMode: SearchMode;
+	/** Tavily key; only used when web search falls back to the plugin tool. */
+	searchApiKey: string;
+	searchMaxResults: number;
+	searchDepth: SearchDepth;
 }
 
 const DEFAULT_SETTINGS: VASettings = {
@@ -57,7 +63,11 @@ const DEFAULT_SETTINGS: VASettings = {
 	systemPrompt: '',
 	lang: 'zh',
 	history: [],
-	sessionId: ''
+	sessionId: '',
+	searchMode: 'off',
+	searchApiKey: '',
+	searchMaxResults: 5,
+	searchDepth: 'basic'
 };
 
 type ChatMessage = import('./agent').ChatMessage;
@@ -283,6 +293,67 @@ class VASettingTab extends PluginSettingTab {
 				name: this.st('systemPrompt'),
 				desc: this.st('systemPromptDesc'),
 				control: { type: 'textarea', key: 'systemPrompt', rows: 4 }
+			},
+			...this.searchSettingDefinitions()
+		];
+	}
+
+	/** Web-search settings; shared by the declarative and the legacy settings UI. */
+	private searchSettingDefinitions(): SettingDefinitionItem[] {
+		const usesTool = () => ['auto', 'tool'].includes(this.plugin.settings.searchMode);
+		const nativeUnsupported = () => {
+			const s = this.plugin.settings;
+			return s.searchMode === 'native' && !nativeSearchFor(s.providerId, s.searchMaxResults);
+		};
+		return [
+			{
+				name: this.st('searchMode'),
+				desc: this.st('searchModeDesc'),
+				control: {
+					type: 'dropdown',
+					key: 'searchMode',
+					options: {
+						off: this.st('searchModeOff'),
+						auto: this.st('searchModeAuto'),
+						native: this.st('searchModeNative'),
+						tool: this.st('searchModeTool')
+					}
+				}
+			},
+			{
+				name: this.st('searchApiKey'),
+				desc: this.st('searchApiKeyDesc'),
+				visible: usesTool,
+				control: { type: 'text', key: 'searchApiKey' }
+			},
+			{
+				name: this.st('searchMaxResults'),
+				visible: usesTool,
+				control: {
+					type: 'number',
+					key: 'searchMaxResults',
+					step: 1,
+					validate: (v) => (typeof v === 'number' && v >= 1 && v <= 20 ? undefined : 'must be 1-20')
+				}
+			},
+			{
+				name: this.st('searchDepth'),
+				visible: usesTool,
+				control: {
+					type: 'dropdown',
+					key: 'searchDepth',
+					options: { basic: this.st('searchDepthBasic'), advanced: this.st('searchDepthAdvanced') }
+				}
+			},
+			{
+				// Description-only row: no control, just the explanation.
+				name: this.st('searchUnsupported'),
+				searchable: false,
+				visible: nativeUnsupported,
+				render: (setting) => {
+					setting.settingEl.addClass('va-hint');
+					return () => setting.settingEl.removeClass('va-hint');
+				}
 			}
 		];
 	}
@@ -309,6 +380,7 @@ class VASettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 		const s = this.plugin.settings;
+		let searchEl: HTMLElement | null = null;
 
 		new Setting(containerEl).setName(this.st('settingsHeading')).setHeading();
 
@@ -336,6 +408,7 @@ class VASettingTab extends PluginSettingTab {
 					s.providerId = v;
 					await this.plugin.saveSettings();
 					this.renderProviderExtras(containerEl);
+					if (searchEl) this.renderSearchSettings(searchEl);
 				});
 			});
 
@@ -397,6 +470,67 @@ class VASettingTab extends PluginSettingTab {
 			.setName(this.st('systemPrompt'))
 			.setDesc(this.st('systemPromptDesc'))
 			.addTextArea(ta => ta.setValue(s.systemPrompt).onChange(async v => { s.systemPrompt = v; await this.plugin.saveSettings(); }));
+
+		searchEl = containerEl.createDiv({ cls: 'va-search-settings' });
+		this.renderSearchSettings(searchEl);
+	}
+
+	/**
+	 * Web-search settings for the legacy (pre-1.13) settings UI. Re-rendered in
+	 * place when the mode or provider changes, because several rows are conditional.
+	 */
+	private renderSearchSettings(el: HTMLElement): void {
+		const s = this.plugin.settings;
+		el.empty();
+
+		const usesTool = () => ['auto', 'tool'].includes(s.searchMode);
+		const rerender = () => this.renderSearchSettings(el);
+
+		new Setting(el)
+			.setName(this.st('searchMode'))
+			.setDesc(this.st('searchModeDesc'))
+			.addDropdown(d => d
+				.addOption('off', this.st('searchModeOff'))
+				.addOption('auto', this.st('searchModeAuto'))
+				.addOption('native', this.st('searchModeNative'))
+				.addOption('tool', this.st('searchModeTool'))
+				.setValue(s.searchMode)
+				.onChange(async v => {
+					s.searchMode = v as SearchMode;
+					await this.plugin.saveSettings();
+					rerender();
+				}));
+
+		if (s.searchMode === 'native' && !nativeSearchFor(s.providerId, s.searchMaxResults)) {
+			const hint = new Setting(el).setClass('va-hint');
+			hint.nameEl.setText('⚠️ ' + this.st('searchUnsupported'));
+		}
+
+		if (!usesTool()) return;
+
+		new Setting(el)
+			.setName(this.st('searchApiKey'))
+			.setDesc(this.st('searchApiKeyDesc'))
+			.addText(tx => {
+				tx.inputEl.type = 'password';
+				tx.setValue(s.searchApiKey)
+					.onChange(async v => { s.searchApiKey = v.trim(); await this.plugin.saveSettings(); });
+			});
+
+		new Setting(el)
+			.setName(this.st('searchMaxResults'))
+			.addText(tx => tx.setValue(String(s.searchMaxResults)).onChange(async v => {
+				const n = parseInt(v, 10);
+				if (n >= 1 && n <= 20) { s.searchMaxResults = n; await this.plugin.saveSettings(); }
+			}));
+
+		new Setting(el)
+			.setName(this.st('searchDepth'))
+			.addDropdown(d => d
+				.addOption('basic', this.st('searchDepthBasic'))
+				.addOption('advanced', this.st('searchDepthAdvanced'))
+				.setValue(s.searchDepth)
+				.onChange(async v => { s.searchDepth = v as SearchDepth; await this.plugin.saveSettings(); }));
 	}
 
 	/** Provider hint + model preset chips; re-rendered in place when the provider changes. */

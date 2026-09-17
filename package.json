@@ -6,7 +6,7 @@
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-		"test": "node test/agent.test.mjs && node test/history.test.mjs"
+		"test": "node test/agent.test.mjs && node test/history.test.mjs && node test/search.test.mjs"
 	},
 	"devDependencies": {
 		"@types/node": "^20.0.0",
