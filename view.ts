@@ -22,6 +22,8 @@ export class AgentView extends ItemView {
 
 	async onOpen(): Promise<void> {
 		this.messages = this.plugin.loadHistory();
+		// An empty transcript means a new conversation: give it its own session id.
+		if (!this.messages.length) this.plugin.startSession();
 		this.renderShell();
 		if (!this.messages.length) this.addWelcome();
 		else this.renderAllHistory();
@@ -29,6 +31,7 @@ export class AgentView extends ItemView {
 
 	async onClose(): Promise<void> {
 		await this.plugin.saveHistory(this.messages);
+		await this.plugin.history.flush();
 		this.abort?.abort();
 	}
 
@@ -48,6 +51,7 @@ export class AgentView extends ItemView {
 		setIcon(newBtn, 'plus');
 		newBtn.addEventListener('click', () => {
 			if (this.running) return;
+			this.plugin.startSession();
 			this.messages = [];
 			void this.plugin.saveHistory([]);
 			this.renderShell();
@@ -57,6 +61,7 @@ export class AgentView extends ItemView {
 		setIcon(clearBtn, 'trash-2');
 		clearBtn.addEventListener('click', () => {
 			if (this.running) return;
+			this.plugin.startSession();
 			this.messages = [];
 			void this.plugin.saveHistory([]);
 			this.renderShell();
@@ -299,6 +304,8 @@ export class AgentView extends ItemView {
 
 		this.renderUserBubble(input);
 		this.messages.push({ role: 'user', content: input });
+		const history = this.plugin.history;
+		history.user(input);
 		if (this.messages[0]?.role !== 'system') {
 			this.messages.unshift({ role: 'system', content: this.buildSystemPrompt() });
 		} else {
@@ -310,6 +317,7 @@ export class AgentView extends ItemView {
 		const executor = new VaultToolExecutor(this.app, () => this.app.workspace.getActiveFile()?.path ?? null);
 		// Tool calls execute sequentially: chips complete in FIFO order.
 		const chipQueue: HTMLElement[] = [];
+		const toolStartedAt = new Map<string, number>();
 
 		try {
 			const proxy = s.proxyUrl.trim();
@@ -335,8 +343,13 @@ export class AgentView extends ItemView {
 					: (url, headers, body) => this.plugin.fallbackPost(url, headers, body),
 				onText: d => stream.push(d),
 				onReasoning: d => stream.pushReasoning(d),
-				onToolStart: call => chipQueue.push(this.addToolChip(call)),
-				onToolDone: (_call, result) => {
+				onToolStart: call => {
+					toolStartedAt.set(call.id, Date.now());
+					history.toolCall(call);
+					chipQueue.push(this.addToolChip(call));
+				},
+				onToolDone: (call, result) => {
+					history.toolResult(call, result, Date.now() - (toolStartedAt.get(call.id) ?? Date.now()));
 					const chip = chipQueue.shift();
 					if (chip) this.completeToolChip(chip, result);
 				}
@@ -344,11 +357,13 @@ export class AgentView extends ItemView {
 			stream.finish(text, reasoning);
 			if (hitCap) new Notice(this.st('maxIterReached'));
 			this.messages.push({ role: 'assistant', content: text });
+			history.assistant(text, reasoning);
 		} catch (e: unknown) {
 			const aborted = this.abort.signal.aborted;
 			const msg = aborted ? (s.lang === 'zh' ? '（已停止）' : '(stopped)') : `${this.st('errPrefix')}: ${e instanceof Error ? e.message : String(e)}`;
 			stream.finish(msg, '');
 			this.messages.push({ role: 'assistant', content: msg });
+			history.error(msg);
 			if (!aborted) new Notice(msg.slice(0, 200));
 		} finally {
 			this.running = false;
