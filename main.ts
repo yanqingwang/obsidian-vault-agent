@@ -1,5 +1,6 @@
-import { App, Plugin, PluginSettingTab, Setting, requestUrl, WorkspaceLeaf, type SettingDefinitionItem } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, normalizePath, requestUrl, WorkspaceLeaf, type SettingDefinitionItem } from 'obsidian';
 import { AgentView, VIEW_TYPE_AGENT } from './view';
+import { HistoryRecorder, newSessionId, type HistoryMeta } from './history';
 import { t, Lang } from './i18n';
 
 export interface ProviderPreset {
@@ -37,6 +38,8 @@ export interface VASettings {
 	systemPrompt: string;
 	lang: Lang;
 	history: ChatMessage[];
+	/** Id of the conversation currently being appended to history.jsonl. */
+	sessionId: string;
 }
 
 const DEFAULT_SETTINGS: VASettings = {
@@ -51,13 +54,15 @@ const DEFAULT_SETTINGS: VASettings = {
 	autoApprove: false,
 	systemPrompt: '',
 	lang: 'zh',
-	history: []
+	history: [],
+	sessionId: ''
 };
 
 type ChatMessage = import('./agent').ChatMessage;
 
 export default class VaultAgentPlugin extends Plugin {
 	settings: VASettings = DEFAULT_SETTINGS;
+	private recorder: HistoryRecorder | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -116,6 +121,43 @@ export default class VaultAgentPlugin extends Plugin {
 	async saveHistory(messages: ChatMessage[]): Promise<void> {
 		this.settings.history = messages.filter(m => m.role !== 'system').slice(-40);
 		await this.saveData(this.settings);
+	}
+
+	/** `history.jsonl` sits next to `data.json`, inside the plugin folder. */
+	private historyPath(): string {
+		const dir = this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
+		return normalizePath(`${dir}/history.jsonl`);
+	}
+
+	/**
+	 * Durable transcript used by `tools/history_db.py`. Unlike `saveHistory`
+	 * (last 40 messages, overwritten each turn) this is append-only and keeps
+	 * timestamps, session ids and tool calls.
+	 */
+	get history(): HistoryRecorder {
+		if (!this.recorder) {
+			const session = this.settings.sessionId || this.startSession();
+			this.recorder = new HistoryRecorder(
+				this.app.vault.adapter,
+				this.historyPath(),
+				session,
+				(): HistoryMeta => ({
+					vault: this.app.vault.getName(),
+					provider: this.settings.providerId,
+					model: this.settings.model
+				})
+			);
+		}
+		return this.recorder;
+	}
+
+	/** Rotate the session id so a new chat is a separate session in the database. */
+	startSession(): string {
+		const id = newSessionId();
+		this.settings.sessionId = id;
+		this.recorder = null;
+		void this.saveSettings();
+		return id;
 	}
 }
 

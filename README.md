@@ -30,13 +30,32 @@ A China-first Obsidian agent plugin that talks directly to OpenAI-compatible LLM
 - **写操作确认**：默认每次创建/修改前询问；可在设置中开启自动执行。
 - **上下文感知**：自动告知当前打开的笔记路径，方便直接整理正在编辑的内容。
 - **中文优先**：内置中文系统提示与界面，可切换英文；自定义系统提示词。
-- **会话保留**：最近对话自动保存，重启后继续。
+- **会话保留**：最近对话自动保存，重启后继续；完整记录另存为可检索的 `history.jsonl`（见下）。
 
 ## 使用 / Usage
 
 1. 设置 → Vault Agent → 选择服务商 → 粘贴 API Key → 选择模型。
 2. 点击左侧 ribbon 图标（或命令面板 "Open Vault Agent"）打开侧栏对话。
 3. 例如：「找出最近关于 X 的笔记整理成一篇 MOC」「把当前笔记的结尾改成总结段落」。
+
+## 会话历史 / Conversation history
+
+聊天过程中，插件把每条事件（用户消息、助手回答、思考、工具调用与结果）追加写入
+`.obsidian/plugins/vault-agent/history.jsonl`。`data.json` 里只留最近 40 条用于恢复界面，
+这份 JSONL 才是带时间戳、带会话 id、带工具调用的完整记录。用 `tools/history_db.py`
+（仅标准库）导入 SQLite，即可随时检索：
+
+```bash
+python tools/history_db.py import                  # 增量导入，可重复执行
+python tools/history_db.py search 同步任务          # 全文检索（FTS5 trigram，支持中文）
+python tools/history_db.py search --tool read_note  # 按工具过滤
+python tools/history_db.py sessions                # 列出会话
+python tools/history_db.py show <session 前缀>      # 打印某个会话的完整对话
+python tools/history_db.py stats
+```
+
+数据库默认落在 JSONL 同目录（`history.db`）；导入按事件 id 去重，重复运行只写入新增事件。
+路径可用 `--vault <vault 根目录>` 或 `--jsonl/--db` 指定。
 
 ## 安全 / Safety
 
@@ -49,7 +68,7 @@ A China-first Obsidian agent plugin that talks directly to OpenAI-compatible LLM
 ```bash
 npm install
 npm run build   # tsc 检查 + esbuild 产出 main.js
-npm test        # node 端到端单测（mock SSE 服务 + 工具循环）
+npm test        # node 端到端单测（mock SSE 服务 + 工具循环 + 历史记录器）
 ```
 
 ## License

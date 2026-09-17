@@ -15,5 +15,5 @@
 		"skipLibCheck": true,
 		"lib": ["DOM", "ES2020"]
 	},
-	"include": ["main.ts", "agent.ts", "tools.ts", "view.ts", "i18n.ts"]
+	"include": ["main.ts", "agent.ts", "tools.ts", "view.ts", "i18n.ts", "history.ts"]
 }

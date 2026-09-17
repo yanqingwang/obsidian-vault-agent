@@ -625,6 +625,8 @@ var AgentView = class extends import_obsidian2.ItemView {
   }
   async onOpen() {
     this.messages = this.plugin.loadHistory();
+    if (!this.messages.length)
+      this.plugin.startSession();
     this.renderShell();
     if (!this.messages.length)
       this.addWelcome();
@@ -633,6 +635,7 @@ var AgentView = class extends import_obsidian2.ItemView {
   }
   async onClose() {
     await this.plugin.saveHistory(this.messages);
+    await this.plugin.history.flush();
     this.abort?.abort();
   }
   st(key) {
@@ -652,6 +655,7 @@ var AgentView = class extends import_obsidian2.ItemView {
     newBtn.addEventListener("click", () => {
       if (this.running)
         return;
+      this.plugin.startSession();
       this.messages = [];
       void this.plugin.saveHistory([]);
       this.renderShell();
@@ -662,6 +666,7 @@ var AgentView = class extends import_obsidian2.ItemView {
     clearBtn.addEventListener("click", () => {
       if (this.running)
         return;
+      this.plugin.startSession();
       this.messages = [];
       void this.plugin.saveHistory([]);
       this.renderShell();
@@ -889,6 +894,8 @@ var AgentView = class extends import_obsidian2.ItemView {
     this.sendBtn.disabled = true;
     this.renderUserBubble(input);
     this.messages.push({ role: "user", content: input });
+    const history = this.plugin.history;
+    history.user(input);
     if (this.messages[0]?.role !== "system") {
       this.messages.unshift({ role: "system", content: this.buildSystemPrompt() });
     } else {
@@ -898,6 +905,7 @@ var AgentView = class extends import_obsidian2.ItemView {
     const tools = buildToolDefs();
     const executor = new VaultToolExecutor(this.app, () => this.app.workspace.getActiveFile()?.path ?? null);
     const chipQueue = [];
+    const toolStartedAt = /* @__PURE__ */ new Map();
     try {
       const fetchImpl = (url, init) => window.fetch(url, init);
       const { text, reasoning, hitCap } = await runAgentLoop({
@@ -916,8 +924,13 @@ var AgentView = class extends import_obsidian2.ItemView {
         fallbackPost: (url, headers, body) => this.plugin.fallbackPost(url, headers, body),
         onText: (d) => stream.push(d),
         onReasoning: (d) => stream.pushReasoning(d),
-        onToolStart: (call) => chipQueue.push(this.addToolChip(call)),
-        onToolDone: (_call, result) => {
+        onToolStart: (call) => {
+          toolStartedAt.set(call.id, Date.now());
+          history.toolCall(call);
+          chipQueue.push(this.addToolChip(call));
+        },
+        onToolDone: (call, result) => {
+          history.toolResult(call, result, Date.now() - (toolStartedAt.get(call.id) ?? Date.now()));
           const chip = chipQueue.shift();
           if (chip)
             this.completeToolChip(chip, result);
@@ -927,11 +940,13 @@ var AgentView = class extends import_obsidian2.ItemView {
       if (hitCap)
         new import_obsidian2.Notice(this.st("maxIterReached"));
       this.messages.push({ role: "assistant", content: text });
+      history.assistant(text, reasoning);
     } catch (e) {
       const aborted = this.abort.signal.aborted;
       const msg = aborted ? s.lang === "zh" ? "\uFF08\u5DF2\u505C\u6B62\uFF09" : "(stopped)" : `${this.st("errPrefix")}: ${e instanceof Error ? e.message : String(e)}`;
       stream.finish(msg, "");
       this.messages.push({ role: "assistant", content: msg });
+      history.error(msg);
       if (!aborted)
         new import_obsidian2.Notice(msg.slice(0, 200));
     } finally {
@@ -940,6 +955,89 @@ var AgentView = class extends import_obsidian2.ItemView {
       this.sendBtn.disabled = false;
       void this.plugin.saveHistory(this.messages);
     }
+  }
+};
+
+// history.ts
+function newSessionId() {
+  return `${Date.now().toString(36)}-${randomHex(8)}`;
+}
+function randomHex(length) {
+  const webCrypto = typeof crypto !== "undefined" ? crypto : null;
+  if (webCrypto && typeof webCrypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(Math.ceil(length / 2));
+    webCrypto.getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("").slice(0, length);
+  }
+  let out = "";
+  for (let i = 0; i < length; i++)
+    out += Math.floor(Math.random() * 16).toString(16);
+  return out;
+}
+var HistoryRecorder = class {
+  constructor(adapter, path, sessionId, meta) {
+    this.adapter = adapter;
+    this.path = path;
+    this.sessionId = sessionId;
+    this.meta = meta;
+    this.seq = 0;
+    this.turn = 0;
+    /** Tail of the append chain; keeps lines whole when events arrive rapidly. */
+    this.pending = Promise.resolve();
+  }
+  user(text) {
+    this.turn++;
+    this.write({ type: "user", role: "user", content: text });
+  }
+  assistant(text, reasoning) {
+    this.write({ type: "assistant", role: "assistant", content: text, reasoning: reasoning || void 0 });
+  }
+  toolCall(call) {
+    this.write({
+      type: "tool_call",
+      role: "tool",
+      tool: call.function.name,
+      callId: call.id,
+      args: call.function.arguments
+    });
+  }
+  toolResult(call, result, durationMs) {
+    this.write({
+      type: "tool_result",
+      role: "tool",
+      tool: call.function.name,
+      callId: call.id,
+      ok: result.ok,
+      content: result.content,
+      durationMs: Math.max(0, Math.round(durationMs))
+    });
+  }
+  error(message) {
+    this.write({ type: "error", role: "assistant", content: message });
+  }
+  /** Resolves once every queued line has been handed to the adapter. */
+  flush() {
+    return this.pending;
+  }
+  /**
+   * Appends are chained rather than fired in parallel: two overlapping
+   * `append` calls could otherwise interleave and corrupt a JSONL line.
+   * Logging must never break the chat, so failures are swallowed.
+   */
+  write(partial) {
+    this.seq++;
+    const event = {
+      ...this.meta(),
+      id: randomHex(16),
+      ts: Date.now(),
+      iso: (/* @__PURE__ */ new Date()).toISOString(),
+      session: this.sessionId,
+      seq: this.seq,
+      turn: this.turn,
+      ...partial
+    };
+    const line = JSON.stringify(event) + "\n";
+    this.pending = this.pending.then(() => this.adapter.append(this.path, line)).catch(() => void 0);
   }
 };
 
@@ -968,12 +1066,14 @@ var DEFAULT_SETTINGS = {
   autoApprove: false,
   systemPrompt: "",
   lang: "zh",
-  history: []
+  history: [],
+  sessionId: ""
 };
 var VaultAgentPlugin = class extends import_obsidian3.Plugin {
   constructor() {
     super(...arguments);
     this.settings = DEFAULT_SETTINGS;
+    this.recorder = null;
   }
   async onload() {
     await this.loadSettings();
@@ -1022,6 +1122,40 @@ var VaultAgentPlugin = class extends import_obsidian3.Plugin {
   async saveHistory(messages) {
     this.settings.history = messages.filter((m) => m.role !== "system").slice(-40);
     await this.saveData(this.settings);
+  }
+  /** `history.jsonl` sits next to `data.json`, inside the plugin folder. */
+  historyPath() {
+    const dir = this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
+    return (0, import_obsidian3.normalizePath)(`${dir}/history.jsonl`);
+  }
+  /**
+   * Durable transcript used by `tools/history_db.py`. Unlike `saveHistory`
+   * (last 40 messages, overwritten each turn) this is append-only and keeps
+   * timestamps, session ids and tool calls.
+   */
+  get history() {
+    if (!this.recorder) {
+      const session = this.settings.sessionId || this.startSession();
+      this.recorder = new HistoryRecorder(
+        this.app.vault.adapter,
+        this.historyPath(),
+        session,
+        () => ({
+          vault: this.app.vault.getName(),
+          provider: this.settings.providerId,
+          model: this.settings.model
+        })
+      );
+    }
+    return this.recorder;
+  }
+  /** Rotate the session id so a new chat is a separate session in the database. */
+  startSession() {
+    const id = newSessionId();
+    this.settings.sessionId = id;
+    this.recorder = null;
+    void this.saveSettings();
+    return id;
   }
 };
 var VASettingTab = class extends import_obsidian3.PluginSettingTab {
