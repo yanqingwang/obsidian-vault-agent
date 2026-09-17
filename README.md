@@ -8,7 +8,7 @@ A China-first Obsidian agent plugin that talks directly to OpenAI-compatible LLM
 
 ## 为什么做这个 / Why
 
-海外的同类形态（[Claudian](https://github.com/yishentu/claudian)，200万+ 下载）依赖 Claude Code CLI 与海外订阅，国内用户配置门槛高且支付困难。Vault Agent 把同一形态的智能体体验变成**填一个 API Key 就能用**：
+海外的同类形态（[Claudian](https://github.com/yishentu/claudian)）依赖 Claude Code CLI 与海外订阅，国内用户配置门槛高且支付困难。Vault Agent 把同一形态的智能体体验变成**填一个 API Key 就能用**：
 
 | 你想用 | 选这个预设 |
 |---|---|
