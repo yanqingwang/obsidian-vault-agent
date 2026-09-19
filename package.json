@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-vault-agent",
-	"version": "0.1.8",
+	"version": "0.1.9",
 	"description": "AI vault agent powered by China-accessible LLM APIs (DeepSeek / GLM / Kimi / Qwen / any OpenAI-compatible endpoint). Agentic read/search/create/edit of notes — no CLI, no proxy.",
 	"main": "main.js",
 	"scripts": {

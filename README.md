@@ -4,7 +4,7 @@
 
 中文优先的 Obsidian vault 智能体插件——直连国产大模型 API（OpenAI 兼容协议），智能体可自主**搜索、读取、创建、修改**你的笔记。无需安装任何 CLI，无需海外账号，无需配置环境变量。
 
-**当前版本：v0.1.8**
+**当前版本：v0.1.9**
 
 ## 为什么做这个
 
@@ -28,6 +28,7 @@
 - **智能体工具调用**：`search_notes` / `read_note` / `list_notes` / `get_active_note` / `create_note` / `edit_note`（精确替换）/ `append_note` / `read_properties`，单轮可多步连续操作。
 - **流式输出**：SSE 流式渲染，支持 reasoning（DeepSeek-R1 / Kimi thinking 等）；直连失败自动降级为非流式（Obsidian requestUrl）。
 - **本地代理（可选）**：AI 请求可经本机 HTTP 代理转发（`http://` 绝对 URI 直转、`https://` CONNECT 隧道），仅桌面端。
+- **联网搜索（可选）**：用服务商内置联网（GLM / Kimi / Qwen / OpenRouter），或用插件自带的 `web_search` 工具（Tavily）——DeepSeek 这类没有内置联网的服务商也能搜。
 - **写操作确认**：默认每次创建/修改前询问；可在设置中开启自动执行。
 - **上下文感知**：自动告知当前打开的笔记路径，方便直接整理正在编辑的内容。
 - **中文优先**：内置中文系统提示与界面，可切换英文；自定义系统提示词。
@@ -44,6 +45,22 @@
 
 设置 → Vault Agent → **本地代理（可选）** 填 `host:port`（如 `http://127.0.0.1:9000`；需认证时写 `user:pass@host:port`），
 AI 请求即经该代理转发，便于抓包排查或在受限网络下中转；留空直连。仅桌面端生效，不支持 SOCKS。
+
+## 联网搜索
+
+模型训练数据有截止日期，库内笔记也未必覆盖最新信息。设置 → Vault Agent → **联网搜索** 有四档：
+
+| 模式 | 行为 |
+|---|---|
+| 关闭 | 默认。只用模型自身知识与库内笔记 |
+| 自动 | 服务商有内置联网就用内置，否则回退到插件工具（需 Tavily Key） |
+| 仅服务商内置 | GLM / Z.ai / Kimi / Qwen / OpenRouter |
+| 仅插件工具 | 用 Tavily，**任何服务商**都能联网（含 DeepSeek） |
+
+- **服务商内置**不需要额外 Key，检索在服务商侧完成。DeepSeek 官方 API 不支持联网；火山方舟的联网插件开启后会**禁用函数调用**（会废掉全部库内工具），因此未接入。
+- **插件工具**需要 Tavily Key：到 [app.tavily.com](https://app.tavily.com) 注册（免费额度 1000 次/月），填进「Tavily API Key」。检索结果会并入上下文，因此既计入 token，也按次计费。
+- 可调「每次搜索返回条数」与「搜索深度」（basic 1 credit / advanced 2 credits）。
+- 若服务商拒绝了联网参数，本轮会自动去掉该参数重试一次，不会因此整轮失败。
 
 ## 会话历史
 

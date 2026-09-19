@@ -4,7 +4,7 @@
 
 A China-first Obsidian agent plugin that talks directly to OpenAI-compatible LLM APIs and can autonomously **search, read, create and edit** your notes. No CLI to install, no overseas account, no environment variables to configure.
 
-**Current version: v0.1.8**
+**Current version: v0.1.9**
 
 ## Why
 
@@ -28,6 +28,7 @@ The closest equivalent overseas ([Claudian](https://github.com/yishentu/claudian
 - **Agent tool calls**: `search_notes` / `read_note` / `list_notes` / `get_active_note` / `create_note` / `edit_note` (exact replace) / `append_note` / `read_properties`, with multiple steps per turn.
 - **Streaming**: SSE rendering with reasoning support (DeepSeek-R1 / Kimi thinking and friends); falls back to non-streaming (Obsidian `requestUrl`) when the direct connection fails.
 - **Local proxy (optional)**: route AI requests through a local HTTP proxy (absolute-URI forwarding for `http`, CONNECT tunnelling for `https`). Desktop only.
+- **Web search (optional)**: use the provider's own search (GLM / Kimi / Qwen / OpenRouter), or the bundled `web_search` tool backed by Tavily — so providers without native search, DeepSeek included, can search too.
 - **Write confirmation**: creating or editing asks first by default; can be auto-approved in settings.
 - **Context aware**: the agent is told which note is open, so it can work on what you are editing.
 - **China-first**: a Chinese system prompt and UI are built in, switchable to English; you can also supply your own system prompt.
@@ -43,6 +44,22 @@ The closest equivalent overseas ([Claudian](https://github.com/yishentu/claudian
 ## Local proxy
 
 Settings → Vault Agent → **Local proxy (optional)**: enter `host:port` (e.g. `http://127.0.0.1:9000`, or `user:pass@host:port` when the proxy needs authentication) and AI requests go through it — handy for inspecting traffic with a local proxy or for relaying on a restricted network. Leave it empty to connect directly. Desktop only; SOCKS is not supported.
+
+## Web search
+
+A model's training data has a cut-off, and your notes may not cover recent events. Settings → Vault Agent → **Web search** has four modes:
+
+| Mode | Behaviour |
+|---|---|
+| Off | Default. The model uses its own knowledge plus your notes |
+| Auto | Provider-native search when the provider has it, otherwise the plugin tool (needs a Tavily key) |
+| Provider-native only | GLM / Z.ai / Kimi / Qwen / OpenRouter |
+| Plugin tool only | Tavily, so **any** provider can search — DeepSeek included |
+
+- **Provider-native** search needs no extra key; the vendor does the retrieval. DeepSeek's API has no web search, and Volcengine Ark's search plugin **disables function calling** while it is on (which would break every vault tool), so Ark is not wired up.
+- **The plugin tool** needs a Tavily key: sign up at [app.tavily.com](https://app.tavily.com) (free tier: 1,000 searches/month) and paste it into "Tavily API key". Search results are merged into the context, so they cost both tokens and a per-search fee.
+- "Results per search" and "Search depth" (basic = 1 credit, advanced = 2) are configurable.
+- If a provider rejects the search parameters, the turn is retried once without them instead of failing.
 
 ## Conversation history
 
