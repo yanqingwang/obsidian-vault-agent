@@ -12,6 +12,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const dir = mkdtempSync(join(tmpdir(), 'va-search-'));
+
+// search.ts uses window.setTimeout for its request timeout (Obsidian is a browser
+// environment); shim it the way agent.test.mjs shims window.require.
+globalThis.window = { setTimeout, clearTimeout };
+
 const out = join(dir, 'search.mjs');
 const outAgent = join(dir, 'agent.mjs');
 await Promise.all([
@@ -37,6 +42,7 @@ const {
 	buildTavilyBody,
 	formatTavilyResults,
 	createWebSearchExecutor,
+	withTimeout,
 	WEB_SEARCH_TOOL_NAME,
 	TAVILY_URL
 } = await import(pathToFileURL(out).href);
@@ -177,7 +183,19 @@ const noKey = await createWebSearchExecutor(post, () => ({ ...settings, apiKey: 
 	.execute(WEB_SEARCH_TOOL_NAME, JSON.stringify({ query: 'x' }));
 assert.ok(noKey.content.includes('not configured'), 'missing key is explained, not thrown');
 
-// --- 6. end-to-end wiring: model → web_search → Tavily → model ---------------
+// --- 6. a stalled search must fail the tool, not freeze the turn -------------
+// view.ts composes the executor with withTimeout; replicate that here.
+await assert.rejects(withTimeout(new Promise(() => {}), 30, 'web search'), /timed out/, 'withTimeout rejects a hung call');
+assert.equal(await withTimeout(Promise.resolve(7), 1000, 'x'), 7, 'withTimeout passes values through');
+const stalledExec = createWebSearchExecutor(
+	(url, headers, body) => withTimeout(new Promise(() => {}), 30, 'web search'),
+	() => settings
+);
+const timedOut = await stalledExec.execute(WEB_SEARCH_TOOL_NAME, JSON.stringify({ query: 'x' }));
+assert.equal(timedOut.ok, false, 'a stalled search returns a failed tool result');
+assert.ok(timedOut.content.includes('timed out'), 'and says why');
+
+// --- 7. end-to-end wiring: model → web_search → Tavily → model ---------------
 // view.ts builds this composition and cannot be unit-tested, so replicate it
 // here: the tool name the model calls must be the name the executor routes on.
 {

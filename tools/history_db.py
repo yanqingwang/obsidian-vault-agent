@@ -303,7 +303,9 @@ def cmd_show(conn: sqlite3.Connection, prefix: str) -> None:
         sys.exit(f"ambiguous prefix {prefix!r}: {', '.join(m['id'][:8] for m in matches)}")
     session_id = matches[0]["id"]
     rows = conn.execute(
-        "SELECT * FROM messages WHERE session_id = ? ORDER BY seq", (session_id,)
+        # ts first: older builds restarted `seq` mid-session when the plugin was
+        # reloaded, so seq alone can interleave two runs of the same conversation.
+        "SELECT * FROM messages WHERE session_id = ? ORDER BY ts_ms, seq", (session_id,)
     ).fetchall()
     print(f"# session {session_id} ({len(rows)} events)\n")
     for row in rows:

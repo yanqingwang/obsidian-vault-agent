@@ -67,6 +67,9 @@ const zh = {
 	searchDepthAdvanced: 'advanced（更全，2 credits）',
 	searchUnsupported: '当前服务商不提供内置联网。改用「仅插件工具」并填 Tavily Key，或换用 GLM / Kimi / Qwen / OpenRouter。',
 	searchFallback: '服务商拒绝了联网参数，本轮已按不联网重试。',
+	busy: '智能体还在回复中，完成后再打开历史记录。',
+	maxIterNoAnswer: '⚠️ 已达单轮工具调用上限，本轮没有生成回答。回复「继续」我就接着做；也可以在设置里调大「单轮最大工具调用次数」。',
+	emptyReply: '⚠️ 模型本轮没有返回任何内容（可能是服务商侧中断、或触发了输出长度限制）。请直接重试，或换个说法再问一次。',
 } as const;
 
 type Dict = Record<keyof typeof zh, string>;
@@ -138,6 +141,9 @@ const en: Dict = {
 	searchDepthAdvanced: 'advanced (thorough, 2 credits)',
 	searchUnsupported: 'This provider has no native web search. Switch to "Plugin tool only" and add a Tavily key, or move to GLM / Kimi / Qwen / OpenRouter.',
 	searchFallback: 'The provider rejected the search parameters; this turn was retried without web search.',
+	busy: 'The agent is still replying — open history again once it finishes.',
+	maxIterNoAnswer: '⚠️ Hit the tool-call limit for this turn, so no answer was generated. Reply "continue" and I will pick it up, or raise "Max tool calls per turn" in settings.',
+	emptyReply: '⚠️ The model returned no content this turn (a provider-side interruption, or the output-length limit). Try again, or rephrase the question.',
 };
 
 export const STRINGS: Record<Lang, Dict> = { zh, en };

@@ -727,6 +727,21 @@ function asString(value) {
 function oneLine(text) {
   return text.replace(/\s+/g, " ").trim();
 }
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const handle = window.setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1e3)}s`)), ms);
+    promise.then(
+      (value) => {
+        window.clearTimeout(handle);
+        resolve(value);
+      },
+      (reason) => {
+        window.clearTimeout(handle);
+        reject(reason instanceof Error ? reason : new Error(String(reason)));
+      }
+    );
+  });
+}
 function errorMessage(data) {
   if (typeof data.error === "string")
     return data.error;
@@ -803,7 +818,10 @@ var zh = {
   searchDepthBasic: "basic\uFF08\u5FEB\uFF0C1 credit\uFF09",
   searchDepthAdvanced: "advanced\uFF08\u66F4\u5168\uFF0C2 credits\uFF09",
   searchUnsupported: "\u5F53\u524D\u670D\u52A1\u5546\u4E0D\u63D0\u4F9B\u5185\u7F6E\u8054\u7F51\u3002\u6539\u7528\u300C\u4EC5\u63D2\u4EF6\u5DE5\u5177\u300D\u5E76\u586B Tavily Key\uFF0C\u6216\u6362\u7528 GLM / Kimi / Qwen / OpenRouter\u3002",
-  searchFallback: "\u670D\u52A1\u5546\u62D2\u7EDD\u4E86\u8054\u7F51\u53C2\u6570\uFF0C\u672C\u8F6E\u5DF2\u6309\u4E0D\u8054\u7F51\u91CD\u8BD5\u3002"
+  searchFallback: "\u670D\u52A1\u5546\u62D2\u7EDD\u4E86\u8054\u7F51\u53C2\u6570\uFF0C\u672C\u8F6E\u5DF2\u6309\u4E0D\u8054\u7F51\u91CD\u8BD5\u3002",
+  busy: "\u667A\u80FD\u4F53\u8FD8\u5728\u56DE\u590D\u4E2D\uFF0C\u5B8C\u6210\u540E\u518D\u6253\u5F00\u5386\u53F2\u8BB0\u5F55\u3002",
+  maxIterNoAnswer: "\u26A0\uFE0F \u5DF2\u8FBE\u5355\u8F6E\u5DE5\u5177\u8C03\u7528\u4E0A\u9650\uFF0C\u672C\u8F6E\u6CA1\u6709\u751F\u6210\u56DE\u7B54\u3002\u56DE\u590D\u300C\u7EE7\u7EED\u300D\u6211\u5C31\u63A5\u7740\u505A\uFF1B\u4E5F\u53EF\u4EE5\u5728\u8BBE\u7F6E\u91CC\u8C03\u5927\u300C\u5355\u8F6E\u6700\u5927\u5DE5\u5177\u8C03\u7528\u6B21\u6570\u300D\u3002",
+  emptyReply: "\u26A0\uFE0F \u6A21\u578B\u672C\u8F6E\u6CA1\u6709\u8FD4\u56DE\u4EFB\u4F55\u5185\u5BB9\uFF08\u53EF\u80FD\u662F\u670D\u52A1\u5546\u4FA7\u4E2D\u65AD\u3001\u6216\u89E6\u53D1\u4E86\u8F93\u51FA\u957F\u5EA6\u9650\u5236\uFF09\u3002\u8BF7\u76F4\u63A5\u91CD\u8BD5\uFF0C\u6216\u6362\u4E2A\u8BF4\u6CD5\u518D\u95EE\u4E00\u6B21\u3002"
 };
 var en = {
   viewName: "Vault Agent",
@@ -871,7 +889,10 @@ var en = {
   searchDepthBasic: "basic (fast, 1 credit)",
   searchDepthAdvanced: "advanced (thorough, 2 credits)",
   searchUnsupported: 'This provider has no native web search. Switch to "Plugin tool only" and add a Tavily key, or move to GLM / Kimi / Qwen / OpenRouter.',
-  searchFallback: "The provider rejected the search parameters; this turn was retried without web search."
+  searchFallback: "The provider rejected the search parameters; this turn was retried without web search.",
+  busy: "The agent is still replying \u2014 open history again once it finishes.",
+  maxIterNoAnswer: '\u26A0\uFE0F Hit the tool-call limit for this turn, so no answer was generated. Reply "continue" and I will pick it up, or raise "Max tool calls per turn" in settings.',
+  emptyReply: "\u26A0\uFE0F The model returned no content this turn (a provider-side interruption, or the output-length limit). Try again, or rephrase the question."
 };
 var STRINGS = { zh, en };
 function t(lang, key) {
@@ -1196,8 +1217,15 @@ var AgentView = class extends import_obsidian2.ItemView {
   }
   async onOpen() {
     this.messages = this.plugin.loadHistory();
-    if (!this.messages.length)
+    if (!this.messages.length) {
       this.plugin.startSession();
+    } else {
+      const sessionId = this.plugin.settings.sessionId;
+      if (sessionId) {
+        const cursor = sessionCursor(parseHistory(await this.plugin.readHistoryText()), sessionId);
+        this.plugin.resumeSession(sessionId, cursor);
+      }
+    }
     this.renderShell();
     if (!this.messages.length)
       this.addWelcome();
@@ -1289,6 +1317,10 @@ var AgentView = class extends import_obsidian2.ItemView {
     this.historyEl.toggle(onHistory);
   }
   async openHistory() {
+    if (this.running) {
+      new import_obsidian2.Notice(this.st("busy"));
+      return;
+    }
     this.historyText = await this.plugin.readHistoryText();
     this.historyQuery = "";
     this.setMode("history");
@@ -1576,12 +1608,13 @@ var AgentView = class extends import_obsidian2.ItemView {
       const r = await fetchImpl(url, { method: "POST", headers, body });
       return { status: r.status, body: await r.text() };
     } : (url, headers, body) => this.plugin.fallbackPost(url, headers, body);
+    const searchPost = (url, headers, body) => withTimeout(post(url, headers, body), 2e4, "web search");
     const search = resolveSearch(this.searchSettings());
     const tools = buildToolDefs();
     if (search.tool)
       tools.push(buildWebSearchToolDef());
     const vaultExecutor = new VaultToolExecutor(this.app, () => this.app.workspace.getActiveFile()?.path ?? null);
-    const searchExecutor = createWebSearchExecutor(post, () => this.searchSettings());
+    const searchExecutor = createWebSearchExecutor(searchPost, () => this.searchSettings());
     const executor = {
       execute: (name, args) => name === WEB_SEARCH_TOOL_NAME ? searchExecutor.execute(name, args) : vaultExecutor.execute(name, args)
     };
@@ -1619,11 +1652,12 @@ var AgentView = class extends import_obsidian2.ItemView {
             this.completeToolChip(chip, result);
         }
       });
-      stream.finish(text, reasoning);
+      const reply = text.trim() ? text : hitCap ? this.st("maxIterNoAnswer") : this.st("emptyReply");
+      stream.finish(reply, reasoning);
       if (hitCap)
         new import_obsidian2.Notice(this.st("maxIterReached"));
-      this.messages.push({ role: "assistant", content: text });
-      history.assistant(text, reasoning);
+      this.messages.push({ role: "assistant", content: reply });
+      history.assistant(reply, reasoning);
     } catch (e) {
       const aborted = this.abort.signal.aborted;
       const msg = aborted ? s.lang === "zh" ? "\uFF08\u5DF2\u505C\u6B62\uFF09" : "(stopped)" : `${this.st("errPrefix")}: ${e instanceof Error ? e.message : String(e)}`;
@@ -1716,8 +1750,17 @@ var VaultAgentPlugin = class extends import_obsidian3.Plugin {
     return this.settings.model || this.settings.baseUrl || "not configured";
   }
   /** Non-streaming fallback used when direct fetch streaming fails (e.g. CORS). */
-  async fallbackPost(url, headers, body) {
-    const res = await (0, import_obsidian3.requestUrl)({ url, method: "POST", headers, body, throw: false });
+  /**
+   * Non-streaming POST through Obsidian's `requestUrl` (bypasses CORS, works on
+   * mobile). It ignores AbortSignal and has no timeout, so cap it here: a stalled
+   * endpoint must surface as an error the chat can report, not as a hung turn.
+   */
+  async fallbackPost(url, headers, body, timeoutMs = 12e4) {
+    const res = await withTimeout(
+      (0, import_obsidian3.requestUrl)({ url, method: "POST", headers, body, throw: false }),
+      timeoutMs,
+      "request"
+    );
     return { status: res.status, body: res.text };
   }
   async loadSettings() {

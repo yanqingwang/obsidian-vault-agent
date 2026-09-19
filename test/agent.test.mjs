@@ -356,6 +356,36 @@ assert.ok(sseBody.includes('笔记') || sseBody.includes('tool_calls'), 'proxied
 	assert.equal(result.text, '降级后成功', 'the turn still completes');
 }
 
+// 12. A provider that ends the turn with neither text nor tool calls.
+// Seen in the wild (DeepSeek): runAgentLoop returns empty text and hitCap false,
+// so the view has to explain it rather than render an empty bubble.
+{
+	seenBodies.length = 0;
+	server.removeAllListeners('request');
+	server.on('request', (req, res) => {
+		let body = '';
+		req.on('data', d => body += d);
+		req.on('end', () => {
+			seenBodies.push(JSON.parse(body));
+			res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+			res.end(sse([{ role: 'assistant' }, {}]));
+		});
+	});
+	const result = await runAgentLoop({
+		baseUrl: `http://127.0.0.1:${port}`,
+		apiKey: 'sk-test',
+		model: 'test-model',
+		messages: [{ role: 'user', content: 'hi' }],
+		tools: [],
+		executor,
+		fetchImpl: fetch,
+		maxIterations: 3,
+		onText: () => {}
+	});
+	assert.equal(result.text, '', 'empty response stays empty');
+	assert.equal(result.hitCap, false, 'and is NOT reported as the iteration cap');
+}
+
 proxyServer.close();
 server.close();
 console.log('✅ all agent-loop tests passed');

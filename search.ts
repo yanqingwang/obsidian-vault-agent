@@ -216,8 +216,27 @@ function asString(value: unknown): string {
 	return typeof value === 'string' ? value : '';
 }
 
+/** Collapse all whitespace so an excerpt stays on one line. */
 function oneLine(text: string): string {
 	return text.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Reject if `promise` has not settled within `ms`.
+ *
+ * Obsidian's `requestUrl` ignores AbortSignal and has no timeout of its own, so
+ * without this a stalled provider or search endpoint hangs the whole agent turn
+ * with no way to cancel it. The timer is cleared on settle so a late rejection
+ * cannot surface as an unhandled promise. Node test runs shim `window` first.
+ */
+export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const handle = window.setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms);
+		promise.then(
+			value => { window.clearTimeout(handle); resolve(value); },
+			(reason: unknown) => { window.clearTimeout(handle); reject(reason instanceof Error ? reason : new Error(String(reason))); }
+		);
+	});
 }
 
 function errorMessage(data: Record<string, unknown>): string {

@@ -2,7 +2,7 @@ import { ItemView, WorkspaceLeaf, MarkdownRenderer, Notice, setIcon } from 'obsi
 import { ChatMessage, ToolCall, runAgentLoop, ToolDef, ToolExecutor, normalizeReasoning } from './agent';
 import { FetchLike, makeProxyFetch } from './proxyFetch';
 import { parseHistory, sessionCursor, sessionTranscript, summarizeSessions, type HistoryEvent } from './history';
-import { buildWebSearchToolDef, createWebSearchExecutor, resolveSearch, WEB_SEARCH_TOOL_NAME, type SearchPost, type SearchSettings } from './search';
+import { buildWebSearchToolDef, createWebSearchExecutor, resolveSearch, withTimeout, WEB_SEARCH_TOOL_NAME, type SearchPost, type SearchSettings } from './search';
 import { t } from './i18n';
 import { VaultToolExecutor, buildToolDefs } from './tools';
 import type VaultAgentPlugin from './main';
@@ -24,8 +24,18 @@ export class AgentView extends ItemView {
 
 	async onOpen(): Promise<void> {
 		this.messages = this.plugin.loadHistory();
-		// An empty transcript means a new conversation: give it its own session id.
-		if (!this.messages.length) this.plugin.startSession();
+		if (!this.messages.length) {
+			// An empty transcript means a new conversation: give it its own session id.
+			this.plugin.startSession();
+		} else {
+			// Restored conversation: continue its numbering instead of restarting at
+			// seq 1 / turn 1, which would collide with the events already in the file.
+			const sessionId = this.plugin.settings.sessionId;
+			if (sessionId) {
+				const cursor = sessionCursor(parseHistory(await this.plugin.readHistoryText()), sessionId);
+				this.plugin.resumeSession(sessionId, cursor);
+			}
+		}
 		this.renderShell();
 		if (!this.messages.length) this.addWelcome();
 		else this.renderAllHistory();
@@ -128,6 +138,13 @@ export class AgentView extends ItemView {
 	}
 
 	private async openHistory(): Promise<void> {
+		// Opening the panel mid-request would hide the streaming reply, hide a write
+		// confirmation waiting for a click, and rebuild the DOM the stream writes
+		// into — i.e. the chat would look frozen. Wait for the turn to finish.
+		if (this.running) {
+			new Notice(this.st('busy'));
+			return;
+		}
 		this.historyText = await this.plugin.readHistoryText();
 		this.historyQuery = '';
 		this.setMode('history');
@@ -436,12 +453,16 @@ export class AgentView extends ItemView {
 				return { status: r.status, body: await r.text() };
 			}
 			: (url, headers, body) => this.plugin.fallbackPost(url, headers, body);
+		// Neither fetchImpl here nor requestUrl upstream is abortable, so bound the
+		// search call: a stalled search must fail the tool, not freeze the turn.
+		const searchPost: SearchPost = (url, headers, body) =>
+			withTimeout(post(url, headers, body), 20000, 'web search');
 
 		const search = resolveSearch(this.searchSettings());
 		const tools: ToolDef[] = buildToolDefs();
 		if (search.tool) tools.push(buildWebSearchToolDef());
 		const vaultExecutor = new VaultToolExecutor(this.app, () => this.app.workspace.getActiveFile()?.path ?? null);
-		const searchExecutor = createWebSearchExecutor(post, () => this.searchSettings());
+		const searchExecutor = createWebSearchExecutor(searchPost, () => this.searchSettings());
 		// Two delegates, so the vault executor never learns about the network tool.
 		const executor: ToolExecutor = {
 			execute: (name, args) => name === WEB_SEARCH_TOOL_NAME
@@ -483,10 +504,19 @@ export class AgentView extends ItemView {
 					if (chip) this.completeToolChip(chip, result);
 				}
 			});
-			stream.finish(text, reasoning);
+			// A provider can end a turn with neither text nor tool calls (seen with
+			// DeepSeek), and the iteration cap produces the same shape. Rendering an
+			// empty bubble looks exactly like a frozen window, so always say what
+			// happened instead.
+			const reply = text.trim()
+				? text
+				: hitCap
+					? this.st('maxIterNoAnswer')
+					: this.st('emptyReply');
+			stream.finish(reply, reasoning);
 			if (hitCap) new Notice(this.st('maxIterReached'));
-			this.messages.push({ role: 'assistant', content: text });
-			history.assistant(text, reasoning);
+			this.messages.push({ role: 'assistant', content: reply });
+			history.assistant(reply, reasoning);
 		} catch (e: unknown) {
 			const aborted = this.abort.signal.aborted;
 			const msg = aborted ? (s.lang === 'zh' ? '（已停止）' : '(stopped)') : `${this.st('errPrefix')}: ${e instanceof Error ? e.message : String(e)}`;

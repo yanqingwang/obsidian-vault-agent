@@ -1,7 +1,7 @@
 import { App, Plugin, PluginSettingTab, Setting, normalizePath, requestUrl, WorkspaceLeaf, type SettingDefinitionItem } from 'obsidian';
 import { AgentView, VIEW_TYPE_AGENT } from './view';
 import { HistoryRecorder, newSessionId, type HistoryMeta, type SessionCursor } from './history';
-import { nativeSearchFor, type SearchDepth, type SearchMode } from './search';
+import { nativeSearchFor, withTimeout, type SearchDepth, type SearchMode } from './search';
 import { t, Lang } from './i18n';
 
 export interface ProviderPreset {
@@ -111,8 +111,17 @@ export default class VaultAgentPlugin extends Plugin {
 	}
 
 	/** Non-streaming fallback used when direct fetch streaming fails (e.g. CORS). */
-	async fallbackPost(url: string, headers: Record<string, string>, body: string): Promise<{ status: number; body: string }> {
-		const res = await requestUrl({ url, method: 'POST', headers, body, throw: false });
+	/**
+	 * Non-streaming POST through Obsidian's `requestUrl` (bypasses CORS, works on
+	 * mobile). It ignores AbortSignal and has no timeout, so cap it here: a stalled
+	 * endpoint must surface as an error the chat can report, not as a hung turn.
+	 */
+	async fallbackPost(url: string, headers: Record<string, string>, body: string, timeoutMs = 120000): Promise<{ status: number; body: string }> {
+		const res = await withTimeout(
+			requestUrl({ url, method: 'POST', headers, body, throw: false }),
+			timeoutMs,
+			'request'
+		);
 		return { status: res.status, body: res.text };
 	}
 
